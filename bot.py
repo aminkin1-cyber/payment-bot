@@ -152,28 +152,60 @@ def find_last_row(ws, start=5):
             last = row[0].row
     return last
 
+def _get_fx(ws_parent, ccy):
+    """Lookup FX rate from Settings sheet."""
+    try:
+        for row in ws_parent["Settings"].iter_rows(min_row=7, max_row=20, values_only=True):
+            if str(row[0]) == ccy and row[1]:
+                return float(row[1])
+    except Exception: pass
+    return 1.0
+
+def _get_comm(tp, ccy):
+    """Get commission rate."""
+    if ccy == "RUB": return 0.004
+    return {"Deposit":0.0,"Cash In":0.0,"Payment":0.005,
+            "Cash Out":0.005,"❓ Unknown":0.005}.get(tp, 0.005)
+
+def _prev_balance(ws, r):
+    """Get last computed balance before row r."""
+    last = 0.0
+    for row in ws.iter_rows(min_row=5, max_row=r-1, max_col=11, values_only=True):
+        if row[10] is not None and isinstance(row[10], (int,float)):
+            last = float(row[10])
+    return last
+
 def apply_tx_row(ws, r, tx):
-    tp = tx.get("type", "Payment")
-    bg = TYPE_BG.get(tp, WHITE)
+    tp  = tx.get("type", "Payment")
+    bg  = TYPE_BG.get(tp, WHITE)
+    ccy = tx.get("ccy","USD")
+
+    # Compute values
+    try: amt = float(tx.get("amount") or 0)
+    except: amt = 0.0
+
+    fx = float(tx.get("fx_rate")) if tx.get("fx_rate") else _get_fx(ws.parent, ccy)
+    comm = float(tx.get("comm")) if tx.get("comm") else _get_comm(tp, ccy)
+    gross = round(amt / fx, 2) if fx else amt
+    net   = round(gross, 2) if tp in ("Deposit","Cash In") else round(-(gross/max(1-comm,0.0001)),2)
+    bal   = round(_prev_balance(ws, r) + net, 2)
+
+    # Write base columns A-F, L
     for col_i, val in enumerate([
         tx.get("date",""), tp, tx.get("description",""), tx.get("payee",""),
-        tx.get("ccy",""), tx.get("amount"), tx.get("fx_rate"),
-        None, tx.get("comm"), None, None, tx.get("notes","")
+        ccy, amt, None, None, None, None, None, tx.get("notes","")
     ], 1):
+        if col_i in (7,8,9,10,11): continue
         c = ws.cell(r, col_i, val if val is not None else "")
         sc(c, bg=bg, wrap=(col_i in (3,12)), sz=9)
+
     # G: FX rate
-    if not tx.get("fx_rate"):
-        ws.cell(r,7).value = f'=IF(E{r}="","",IFERROR(VLOOKUP(E{r},Settings!$A$7:$B$16,2,FALSE),1))'
-    ws.cell(r,7).number_format = "0.00000"; sc(ws.cell(r,7), bg=YELLOW, fc="0000CC")
-    # I: comm
-    if not tx.get("comm"):
-        ws.cell(r,9).value = f'=IF(B{r}="","",IFERROR(VLOOKUP(B{r},Settings!$E$19:$F$23,2,FALSE),0))'
-    ws.cell(r,9).number_format = "0.0%"; sc(ws.cell(r,9), bg=YELLOW, fc="0000CC")
-    # H: Gross
-    ws.cell(r,8).value = f'=IF(OR(F{r}="",G{r}=""),"",F{r}/G{r})'
-    ws.cell(r,8).number_format = '#,##0.00'; sc(ws.cell(r,8), bg=YELLOW)
-    # J: Net
+    sc(ws.cell(r, 7, round(fx,5)), bg=YELLOW, fc="0000CC", num="0.00000")
+    # H: Gross USD
+    sc(ws.cell(r, 8, gross), bg=YELLOW, num="#,##0.00")
+    # I: Comm %
+    sc(ws.cell(r, 9, comm), bg=YELLOW, fc="0000CC", num="0.0%")
+    # J: Net USD
     ws.cell(r,10).value = (f'=IF(H{r}="","",IF(OR(B{r}="Deposit",B{r}="Cash In"),'
                            f'H{r},-(H{r}/MAX(1-I{r},0.0001))))')
     ws.cell(r,10).number_format = '#,##0.00'; sc(ws.cell(r,10), bg=YELLOW)
