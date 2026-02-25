@@ -177,9 +177,60 @@ def apply_tx_row(ws, r, tx):
     ws.cell(r,10).value = (f'=IF(H{r}="","",IF(OR(B{r}="Deposit",B{r}="Cash In"),'
                            f'H{r},-(H{r}/MAX(1-I{r},0.0001))))')
     ws.cell(r,10).number_format = '#,##0.00'; sc(ws.cell(r,10), bg=YELLOW)
-    # K: Balance
-    ws.cell(r,11).value = (f'=IF(J{r}="","",IF(ISNUMBER(K{r-1}),K{r-1},Settings!$C$4)+J{r})')
-    ws.cell(r,11).number_format = '#,##0.00'; sc(ws.cell(r,11), bg=YELLOW, bold=True)
+    # K: Balance — compute directly so bot can read it back
+    # Get previous balance
+    prev_bal = 0.0
+    try:
+        for pr in ws.iter_rows(min_row=5, max_row=r-1, max_col=11, values_only=True):
+            if pr[10] is not None and isinstance(pr[10], (int, float)):
+                prev_bal = float(pr[10])
+    except Exception:
+        pass
+    # Get starting balance from Settings if no previous
+    if prev_bal == 0.0:
+        try:
+            wb2 = ws.parent
+            start = wb2["Settings"].cell(4, 3).value
+            if start and isinstance(start, (int, float)):
+                prev_bal = float(start)
+        except Exception:
+            pass
+    # Compute fx_rate value
+    try:
+        fx_val = float(tx.get("fx_rate") or 1.0)
+        if not tx.get("fx_rate"):
+            # lookup from Settings
+            try:
+                ccy = tx.get("ccy","")
+                for srow in ws.parent["Settings"].iter_rows(min_row=7, max_row=16, values_only=True):
+                    if srow[0] == ccy:
+                        fx_val = float(srow[1]); break
+            except Exception:
+                fx_val = 1.0
+    except Exception:
+        fx_val = 1.0
+    try:
+        amt = float(tx.get("amount") or 0)
+        gross = amt / fx_val if fx_val else amt
+        comm_val = float(tx.get("comm") or 0)
+        if not tx.get("comm"):
+            try:
+                tp2 = tx.get("type","Payment")
+                comm_map = {"Deposit":0,"Cash In":0,"Payment":0.005,"Cash Out":0.005,"❓ Unknown":0.005}
+                comm_val = comm_map.get(tp2, 0.005)
+            except Exception:
+                comm_val = 0.005
+        tp2 = tx.get("type","Payment")
+        if tp2 in ("Deposit","Cash In"):
+            net = gross
+        else:
+            net = -(gross / max(1 - comm_val, 0.0001))
+        new_bal = prev_bal + net
+    except Exception as e:
+        new_bal = prev_bal
+
+    ws.cell(r,11).value = round(new_bal, 2)
+    ws.cell(r,11).number_format = '#,##0.00'; sc(ws.cell(r,11), bg=YELLOW, bold=True, fc="1F3864")
     ws.row_dimensions[r].height = 28
 
 def apply_inv_update(ws, upd):
