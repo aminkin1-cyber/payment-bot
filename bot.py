@@ -312,11 +312,65 @@ def add_new_invoice(ws, inv, last_row):
     ws.cell(r,6).number_format = '#,##0.00'; sc(ws.cell(r,6), bg=bg)
     ws.row_dimensions[r].height = 26
 
+
+def apply_transaction_update(ws, upd):
+    """Update notes/status of existing transaction row by matching description."""
+    match_desc = str(upd.get("match_description","")).lower()
+    match_date = str(upd.get("match_date","")).strip()
+    new_notes  = upd.get("new_notes","")
+    confirmed  = upd.get("confirmed", False)
+
+    if not match_desc:
+        return False
+
+    for row in ws.iter_rows(min_row=5):
+        r = row[0].row
+        desc = str(ws.cell(r,3).value or "").lower()
+        date = str(ws.cell(r,1).value or "")
+        notes = str(ws.cell(r,12).value or "")
+
+        # Match by keywords in description
+        keywords = [w for w in match_desc.split() if len(w) > 3]
+        matches = sum(1 for kw in keywords if kw in desc or kw in notes.lower())
+
+        if matches >= 1:
+            # Also check date if provided
+            if match_date and match_date not in date:
+                continue
+
+            # Update notes — remove UNCONFIRMED warning, add confirmation
+            updated_notes = notes
+            updated_notes = updated_notes.replace("⚠ UNCONFIRMED — ", "✅ CONFIRMED — ")
+            updated_notes = updated_notes.replace("Agent did NOT confirm", "Agent CONFIRMED")
+            updated_notes = updated_notes.replace("FOLLOW UP!", "")
+            if new_notes:
+                updated_notes = new_notes
+            if confirmed:
+                ts = datetime.now().strftime("%d.%m.%Y")
+                if "CONFIRMED" not in updated_notes.upper():
+                    updated_notes += f" | Подтверждено агентом {ts}"
+
+            ws.cell(r,12).value = updated_notes.strip()
+
+            # Also update description to remove warning
+            cur_desc = str(ws.cell(r,3).value or "")
+            if "⚠ UNCONFIRMED" in cur_desc or "UNCONFIRMED" in cur_desc:
+                ws.cell(r,3).value = cur_desc.replace("⚠ UNCONFIRMED — ", "✅ ").replace("UNCONFIRMED", "CONFIRMED")
+
+            log.info(f"Transaction updated row {r}: {ws.cell(r,3).value}")
+            return True
+
+    log.warning(f"Transaction not found for update: {match_desc}")
+    return False
+
 def write_to_excel(data: dict):
     if not EXCEL_FILE.exists(): return 0,0,0
     wb  = load_workbook(EXCEL_FILE)
     wst = wb["Transactions"]; wsi = wb["Invoices"]
     tx_a = inv_u = inv_a = 0
+    tx_upd = 0
+    for tu in data.get("transaction_updates", []):
+        if apply_transaction_update(wst, tu): tx_upd += 1
     for tx in data.get("new_transactions", []):
         apply_tx_row(wst, find_last_row(wst) + 1, tx); tx_a += 1
     for upd in data.get("invoice_updates", []):
@@ -324,7 +378,7 @@ def write_to_excel(data: dict):
     for inv in data.get("new_invoices", []):
         add_new_invoice(wsi, inv, find_last_row(wsi)); inv_a += 1
     wb.save(EXCEL_FILE)
-    return tx_a, inv_u, inv_a
+    return tx_a, inv_u, inv_a, tx_upd
 
 # ── Claude API ────────────────────────────────────────────────────────────────
 async def ask_claude(prompt: str, system: str = None) -> str:
@@ -393,9 +447,20 @@ async def parse_messages(msgs_text: str) -> dict:
       "notes": ""
     }}
   ],
+  "transaction_updates": [
+    {{
+      "match_description": "ключевые слова из описания существующей транзакции",
+      "match_date": "DD.MM.YYYY или пусто",
+      "new_notes": "",
+      "confirmed": true
+    }}
+  ],
   "balance_reconciliation": {{
     "agent_stated_balance": null,
-    "discrepancies": []
+    "our_excel_balance": null,
+    "difference": null,
+    "difference_explained_by": [],
+    "unexplained_difference": null
   }},
   "context_update": "краткая запись для контекста — что нового узнали из этих сообщений",
   "summary": "2-3 предложения — что нового произошло"
@@ -403,14 +468,23 @@ async def parse_messages(msgs_text: str) -> dict:
 
 Правила:
 - Сообщение с балансом агента ("Остаток: X") — занеси в balance_reconciliation, не в транзакции
-- "ИСПОЛНЕН", "received", "RCVD" = подтверждение → invoice_updates
-- Депозиты от нас агенту = Deposit, кэш который агент нам доставляет = Cash Out
+- "ИСПОЛНЕН", "received", "RCVD", "Поступление подтверждаем", "получили", "поступило" = подтверждение → invoice_updates, НЕ новая транзакция
+- Если агент подтверждает получение без деталей — ищи в контексте последнюю UNCONFIRMED/FOLLOW UP транзакцию и обновляй её статус на ✅ Paid
+- Депозиты от нас агенту = Deposit. Получатель депозита = конечный получатель денег, не агент и не BALKEMY
+- BALKEMY, TROVECO, RAWRIMA, ASTENO = плательщики (наша сторона), а не получатели
+- Кэш который агент нам доставляет = Cash Out
 - Непонятное → ❓ Unknown
 - Если нечего добавить — пустые массивы
 - ДЕДУПЛИКАЦИЯ: один и тот же инвойс/платёж упомянут несколько раз — добавь ОДИН РАЗ
 - ДЕДУПЛИКАЦИЯ: инвойс уже есть в контексте как оплаченный — не добавляй снова
 - ДЕДУПЛИКАЦИЯ: в new_invoices — объединяй дубли, одна запись на один инвойс
 - Несколько сообщений об одном событии = одна запись
+- ПОДТВЕРЖДЕНИЕ ОТПРАВЛЕННЫХ НАМИ ДЕНЕГ: если агент говорит "Поступление подтверждаем", "received", "получили" 
+  БЕЗ указания инвойса — это значит агент подтвердил наш ранее отправленный депозит или Cash In.
+  В этом случае НЕ добавляй новую транзакцию! Используй transaction_updates чтобы обновить существующую строку.
+  match_description = ключевые слова из описания транзакции (например "150k", "150,000 USD", "50,000 USD")
+  new_notes = старые заметки + " | ПОДТВЕРЖДЕНО АГЕНТОМ [дата]"
+  confirmed = true
 
 ЛОГИКА СВЕРКИ БАЛАНСА (если агент прислал остаток):
 1. agent_stated_balance — сумма из сообщения агента в USD
@@ -481,7 +555,14 @@ def format_confirmation(data: dict) -> str:
             else:
                 lines.append(f"  Необъяснённый остаток: {unexplained} ⚠ Уточнить у агента!")
 
-    if not txs and not upds and not invs:
+    tx_upds = data.get("transaction_updates", [])
+    if tx_upds:
+        lines.append(f"\nОБНОВЛЕНИЯ ТРАНЗАКЦИЙ ({len(tx_upds)}):")
+        for tu in tx_upds:
+            lines.append(f"  ~ {tu.get('match_description','')} "
+                         f"({'✅ подтверждено' if tu.get('confirmed') else 'обновлено'})")
+
+    if not txs and not upds and not invs and not tx_upds:
         lines.append("Новых транзакций или инвойсов не найдено.")
 
     lines.append(f"\nИТОГ: {data.get('summary','')}")
@@ -493,8 +574,10 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Привет! Я трекер платежей с памятью.\n\n"
         "Пересылай мне сообщения от агента, потом:\n\n"
         "/update  — обработать и показать что нашёл (с подтверждением)\n"
-        "/add     — быстро добавить операцию вручную одной строкой\n"
+        "/edit  — добавить, изменить или удалить запись в Excel\n"
+        "/add   — то же самое (псевдоним /edit)\n"
         "/delete  — удалить последнюю строку из транзакций\n"
+        "/edit    — редактировать любую строку: получатель, валюта, статус, примечания\n"
         "/balance — баланс из Excel\n"
         "/pending — что висит\n"
         "/unknown — неизвестные транзакции\n"
@@ -542,6 +625,52 @@ async def cmd_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ])
     await update.message.reply_text(conf_text, reply_markup=keyboard)
 
+
+def apply_edit(data: dict) -> str:
+    """Apply an edit command to Excel."""
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+
+    sheet_name = data.get("sheet", "Transactions")
+    action     = data.get("action", "update")
+    row_n      = int(data.get("row_number", 0))
+    changes    = data.get("changes", {})
+    desc       = data.get("description", "")
+
+    if not EXCEL_FILE.exists():
+        return "Excel файл не найден."
+
+    wb = load_workbook(EXCEL_FILE)
+    ws = wb[sheet_name]
+
+    thin = Side(style="thin", color="BFBFBF")
+    def B(): return Border(top=thin, bottom=thin, left=thin, right=thin)
+
+    if action == "delete":
+        ws.delete_rows(row_n)
+        wb.save(EXCEL_FILE)
+        return f"Строка {row_n} удалена.\n{desc}"
+
+    # Map col names to indices
+    col_map = {
+        "col_A":1,"col_B":2,"col_C":3,"col_D":4,"col_E":5,
+        "col_F":6,"col_G":7,"col_H":8,"col_I":9,"col_J":10,
+        "col_K":11,"col_L":12
+    }
+
+    applied = []
+    for col_name, val in changes.items():
+        if val is None: continue
+        col_idx = col_map.get(col_name)
+        if not col_idx: continue
+        cell = ws.cell(row_n, col_idx, val)
+        cell.font = Font(name="Arial", size=9)
+        cell.border = B()
+        cell.alignment = Alignment(vertical="center", wrap_text=(col_idx in (3,12)))
+        applied.append(f"{col_name}={val}")
+
+    wb.save(EXCEL_FILE)
+    return f"Применено к строке {row_n}:\n" + "\n".join(f"  {a}" for a in applied) + f"\n\n{desc}"
+
 async def callback_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -556,8 +685,26 @@ async def callback_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Нет данных для записи.")
         return
 
+    # Handle /edit command
+    if data.get("type") == "edit":
+        try:
+            result_text = apply_edit(data)
+        except Exception as e:
+            await query.edit_message_text(f"Ошибка редактирования: {e}")
+            log.error(f"Edit error: {e}"); return
+        clear_pending()
+        await query.edit_message_text(result_text)
+        if EXCEL_FILE.exists():
+            await ctx.bot.send_document(
+                chat_id=MY_CHAT_ID,
+                document=EXCEL_FILE.open("rb"),
+                filename=f"Agent_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+                caption="Excel после редактирования"
+            )
+        return
+
     try:
-        tx_a, inv_u, inv_a = write_to_excel(data)
+        tx_a, inv_u, inv_a, tx_upd = write_to_excel(data)
     except Exception as e:
         await query.edit_message_text(f"Ошибка записи в Excel: {e}")
         log.error(f"Excel write error: {e}"); return
@@ -571,6 +718,7 @@ async def callback_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     result = (f"Excel обновлён!\n\n"
               f"Транзакций добавлено: {tx_a}\n"
+              f"Транзакций обновлено: {tx_upd}\n"
               f"Инвойсов обновлено: {inv_u}\n"
               f"Инвойсов добавлено: {inv_a}")
     await query.edit_message_text(result)
@@ -584,60 +732,143 @@ async def callback_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
 
 
-async def cmd_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def cmd_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """
-    Quick manual add. Examples:
-      /add получили 10,000 EUR наличными в Монако
-      /add оплатили инвойс Dubai Insurance 197334.74 AED
-      /add депозит 50000 USD подтверждён агентом
+    Universal Excel editing command. Examples:
+      /edit получили 10,000 EUR наличными в Монако
+      /edit поменяй получателя в последней строке на Dubai Insurance
+      /edit статус Dubai Insurance — оплачен 25.02.2026
+      /edit уточни валюту строки 42 — это BHD а не AED
+      /edit удали последнюю строку
+      /edit Шафранов оплачен $14,280 банковским переводом
     """
     text = " ".join(ctx.args).strip()
     if not text:
         await update.message.reply_text(
-            "Укажи операцию после команды. Примеры:\n\n"
-            "/add получили 10,000 EUR наличными в Монако\n"
-            "/add оплатили инвойс Dubai Insurance 197334.74 AED\n"
-            "/add депозит 50000 USD подтверждён агентом\n"
-            "/add Шафранов оплачен $14,280 банковским переводом"
+            "Примеры команд:\n\n"
+            "ДОБАВИТЬ:\n"
+            "/edit получили 10,000 EUR наличными в Монако\n"
+            "/edit депозит $50,000 подтверждён агентом сегодня\n"
+            "/edit Шафранов оплачен $14,280 банковским переводом\n\n"
+            "ИЗМЕНИТЬ:\n"
+            "/edit поменяй получателя Dubai Insurance на оплаченный статус\n"
+            "/edit исправь валюту последней строки на AED сумма 19502\n"
+            "/edit статус Шафранов — оплачен 25.02.2026\n\n"
+            "УДАЛИТЬ:\n"
+            "/edit удали последнюю транзакцию\n"
+            "/edit удали последние 2 строки"
         )
         return
 
+    # Check if it's a delete command
+    text_lower = text.lower()
+    if any(w in text_lower for w in ["удали", "удалить", "delete"]):
+        n = 1
+        for word in text_lower.split():
+            try: n = int(word); break
+            except: pass
+        n = min(n, 5)
+        if not EXCEL_FILE.exists():
+            await update.message.reply_text("Excel файл не найден.")
+            return
+        wb = load_workbook(EXCEL_FILE)
+        ws = wb["Transactions"]
+        deleted = []
+        for _ in range(n):
+            last = None
+            for row in ws.iter_rows(min_row=5):
+                if row[0].value is not None: last = row[0].row
+            if last:
+                desc = ws.cell(last,3).value or ""
+                amt  = ws.cell(last,6).value or ""
+                ccy  = ws.cell(last,5).value or ""
+                deleted.append(f"{desc} | {amt} {ccy}")
+                ws.delete_rows(last)
+        wb.save(EXCEL_FILE)
+        result = f"Удалено {len(deleted)} строк:\n" + "\n".join(f"- {d}" for d in deleted)
+        await update.message.reply_text(result)
+        if EXCEL_FILE.exists():
+            await ctx.bot.send_document(chat_id=MY_CHAT_ID,
+                document=EXCEL_FILE.open("rb"),
+                filename="Agent_after_edit.xlsx", caption="Excel после правки")
+        return
+
+    # For all other edits — ask Claude to generate JSON
     context = load_context()
+
+    # Get current last 5 transactions for context
+    tx_context = ""
+    if EXCEL_FILE.exists():
+        try:
+            wb2 = load_workbook(EXCEL_FILE, data_only=True)
+            ws2 = wb2["Transactions"]
+            rows = [r for r in ws2.iter_rows(min_row=5, values_only=True) if r[0] is not None]
+            tx_context = "Последние транзакции в Excel:\n" + "\n".join(
+                f"  [{r[0]}] {r[1]} | {r[3] or '?'} | {r[5]} {r[4]} | bal={r[10]}"
+                for r in rows[-8:]
+            )
+            inv_rows = [r for r in wb2["Invoices"].iter_rows(min_row=5, values_only=True)
+                       if r[0] is not None and r[6] and "Pending" in str(r[6])]
+            if inv_rows:
+                tx_context += "\n\nPending инвойсы:\n" + "\n".join(
+                    f"  {r[1]} | {r[2]} | {r[4]} {r[3]} | {r[6]}"
+                    for r in inv_rows[:10]
+                )
+        except Exception as e:
+            log.error(f"Excel read for edit: {e}")
+
     prompt = f"""КОНТЕКСТ ПРОЕКТА:
 {context}
 
+{tx_context}
+
 ---
-Пользователь вручную добавляет операцию одной строкой:
+Пользователь хочет внести правку в Excel одной командой:
 "{text}"
 
-Преобразуй в JSON. Верни ТОЛЬКО валидный JSON без markdown:
+Это может быть:
+1. Добавление новой транзакции
+2. Изменение статуса инвойса (если упоминается получатель + "оплачен/paid/исполнен")
+3. Исправление данных существующей записи (валюта, сумма, получатель)
+
+Верни ТОЛЬКО валидный JSON без markdown:
 {{
   "new_transactions": [
     {{
       "date": "DD.MM.YYYY",
       "type": "Payment|Deposit|Cash Out|Cash In|❓ Unknown",
       "description": "краткое описание",
-      "payee": "получатель или отправитель",
-      "ccy": "EUR|AED|USD|CNY|SGD|RUB|INR",
-      "amount": 10000.00,
+      "payee": "получатель",
+      "ccy": "AED|USD|EUR|CNY|SGD|RUB|INR|BHD",
+      "amount": 0.0,
       "fx_rate": null,
       "comm": null,
-      "notes": "добавлено вручную через /add"
+      "notes": "добавлено вручную"
     }}
   ],
-  "invoice_updates": [],
+  "invoice_updates": [
+    {{
+      "invoice_no": "номер или название",
+      "new_status": "✅ Paid|⏳ Pending|⚠ Partial/Check|❓ Clarify",
+      "date_paid": "DD.MM.YYYY",
+      "ref": ""
+    }}
+  ],
   "new_invoices": [],
   "balance_reconciliation": {{}},
   "context_update": "краткая запись для контекста",
-  "summary": "одна строка — что добавили"
+  "summary": "одна строка — что изменили"
 }}
 
-Правила определения типа:
-- "получили", "кэш", "наличные", "доставили" = Cash Out (агент доставил нам)
-- "оплатили", "заплатили", "платёж" = Payment
-- "депозит", "отправили агенту", "пополнили" = Deposit
-- "получили от нас", "мы отправили" = Cash In
-- Дата не указана → используй сегодняшнюю: {datetime.now().strftime("%d.%m.%Y")}"""
+Правила:
+- "получили кэш/наличные" = Cash Out (агент доставил нам)
+- "оплатили/заплатили" = Payment
+- "депозит/отправили агенту" = Deposit
+- "оплачен/paid/исполнен" + название = invoice_updates
+- BALKEMY/TROVECO/RAWRIMA = плательщики, не получатели
+- Дата не указана → сегодня: {datetime.now().strftime("%d.%m.%Y")}
+- Если правка касается существующей записи (не новая) → используй invoice_updates
+- Если нужно добавить новую строку → new_transactions"""
 
     await update.message.reply_text("Анализирую...")
 
@@ -656,10 +887,14 @@ async def cmd_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     conf_text = format_confirmation(data)
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Записать в Excel", callback_data="confirm_update"),
-         InlineKeyboardButton("❌ Отмена",           callback_data="cancel_update")]
+         InlineKeyboardButton("❌ Отмена", callback_data="cancel_update")]
     ])
     save_pending(data)
     await update.message.reply_text(conf_text, reply_markup=keyboard)
+
+# Keep /add as alias for /edit
+async def cmd_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await cmd_edit(update, ctx)
 
 
 async def cmd_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -704,6 +939,146 @@ async def cmd_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
     else:
         await update.message.reply_text("Нет строк для удаления.")
+
+
+async def cmd_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    Natural language Excel editor. Examples:
+      /edit поменяй получателя в последней строке на MAXIMUS WAY
+      /edit строка с Port of Fujairah — смени статус на оплачен 25.02
+      /edit удали последнюю транзакцию
+      /edit Dubai Insurance — обновить сумму 197334.74 AED
+      /edit $150k строка 41 — добавь ref OR26022400002178 в примечания
+    """
+    text = " ".join(ctx.args).strip()
+    if not text:
+        await update.message.reply_text(
+            "Укажи что изменить. Примеры:\n\n"
+            "/edit поменяй получателя в последней строке на MAXIMUS WAY\n"
+            "/edit строка с Port of Fujairah — статус оплачен 25.02\n"
+            "/edit удали последнюю транзакцию\n"
+            "/edit Dubai Insurance — обновить сумму 197334 AED\n"
+            "/edit строка 41 — добавь примечание: подтверждено агентом"
+        )
+        return
+
+    if not EXCEL_FILE.exists():
+        await update.message.reply_text("Excel файл не найден.")
+        return
+
+    # Read current Excel state to give Claude context
+    wb_read = load_workbook(EXCEL_FILE, data_only=True)
+    ws_read = wb_read["Transactions"]
+    wi_read = wb_read["Invoices"]
+
+    tx_rows = []
+    for row in ws_read.iter_rows(min_row=5, values_only=True):
+        if row[0] is not None:
+            tx_rows.append(row)
+
+    inv_rows = []
+    for row in wi_read.iter_rows(min_row=5, values_only=True):
+        if row[0] is not None or row[1] is not None:
+            inv_rows.append(row)
+
+    # Format for Claude
+    tx_text = "\n".join(
+        f"Row {i+5}: [{r[0]}] {r[1]} | {r[3] or '?'} | {r[5]} {r[4]} | bal={r[10]} | notes={r[11] or ''}"
+        for i, r in enumerate(tx_rows)
+    )
+    inv_text = "\n".join(
+        f"Row {i+5}: [{r[0]}] inv={r[1]} | {r[2]} | {r[4]} {r[3]} | status={r[6]} | paid={r[7]}"
+        for i, r in enumerate(inv_rows)
+    )
+
+    context = load_context()
+
+    prompt = f"""КОНТЕКСТ:
+{context}
+
+ТЕКУЩИЕ ТРАНЗАКЦИИ (Transactions sheet, строки начиная с 5):
+Колонки: A=Date, B=Type, C=Description, D=Payee, E=CCY, F=Amount, G=FX, H=GrossUSD, I=Comm%, J=NetUSD, K=Balance, L=Notes
+{tx_text}
+
+ТЕКУЩИЕ ИНВОЙСЫ (Invoices sheet):
+Колонки: A=Date, B=InvNo, C=Payee, D=CCY, E=Amount, F=USD, G=Status, H=DatePaid, I=Ref, J=Notes
+{inv_text}
+
+КОМАНДА ПОЛЬЗОВАТЕЛЯ: {text}
+
+Верни ТОЛЬКО валидный JSON без markdown:
+{{
+  "sheet": "Transactions|Invoices",
+  "action": "update|delete",
+  "row_number": 42,
+  "changes": {{
+    "col_A": null,
+    "col_B": null,
+    "col_C": null,
+    "col_D": null,
+    "col_E": null,
+    "col_F": null,
+    "col_G": null,
+    "col_H": null,
+    "col_I": null,
+    "col_J": null,
+    "col_K": null,
+    "col_L": null
+  }},
+  "description": "одна строка — что именно меняем и почему"
+}}
+
+Правила:
+- row_number: точный номер строки Excel (начиная с 5)
+- changes: только те колонки которые нужно изменить, остальные null
+- action=delete: удалить строку целиком
+- Для Invoices используй col_A..col_J (10 колонок)
+- Если команда непонятна или строка не найдена — верни {{"error": "описание проблемы"}}
+- Не пересчитывай баланс — только меняй указанные поля"""
+
+    await update.message.reply_text("Анализирую команду...")
+
+    try:
+        raw = await ask_claude(prompt, system=(
+            "You are a JSON assistant. Return ONLY valid JSON, no markdown, no backticks."
+        ))
+        raw = raw.strip().strip("`").strip()
+        if raw.startswith("json"): raw = raw[4:].strip()
+        data = json.loads(raw)
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка анализа: {e}")
+        return
+
+    if "error" in data:
+        await update.message.reply_text(f"Не понял команду: {data['error']}")
+        return
+
+    # Show confirmation
+    desc = data.get("description","")
+    row_n = data.get("row_number")
+    action = data.get("action","update")
+    sheet = data.get("sheet","Transactions")
+    changes = data.get("changes",{})
+
+    non_null = {k:v for k,v in changes.items() if v is not None}
+    changes_text = "\n".join(f"  {k}: {v}" for k,v in non_null.items()) if non_null else "удаление строки"
+
+    confirm_text = (
+        f"Команда: {desc}\n\n"
+        f"Лист: {sheet}\n"
+        f"Строка: {row_n}\n"
+        f"Действие: {action}\n"
+        f"Изменения:\n{changes_text}"
+    )
+
+    save_pending({"type": "edit", "sheet": sheet, "action": action,
+                  "row_number": row_n, "changes": changes, "description": desc})
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Применить", callback_data="confirm_update"),
+         InlineKeyboardButton("❌ Отмена",    callback_data="cancel_update")]
+    ])
+    await update.message.reply_text(confirm_text, reply_markup=keyboard)
 
 async def cmd_balance(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     result = get_balance_from_excel()
@@ -838,7 +1213,7 @@ async def _send_report(bot: Bot, triggered_manually=False):
     if msgs:
         try:
             data    = await parse_messages(_fmt(msgs))
-            tx_a, inv_u, inv_a = write_to_excel(data)
+            tx_a, inv_u, inv_a, tx_upd = write_to_excel(data)
             if data.get("context_update"):
                 update_context_after_update(data["context_update"])
             if tx_a + inv_u + inv_a > 0:
@@ -881,7 +1256,9 @@ def main():
     for cmd, fn in [
         ("start", cmd_start), ("update", cmd_update),
         ("add", cmd_add),
+        ("edit", cmd_edit),
         ("delete", cmd_delete),
+        ("edit", cmd_edit),
         ("balance", cmd_balance), ("pending", cmd_pending),
         ("unknown", cmd_unknown), ("summary", cmd_summary),
         ("excel", cmd_excel), ("context", cmd_context), ("clear", cmd_clear)
