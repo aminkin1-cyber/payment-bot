@@ -91,12 +91,14 @@ def get_excel_summary() -> str:
     bal = get_balance_from_excel()
     if bal:
         lines.append(f"Баланс агента: ${bal[0]:,.2f} USD (на {bal[1]})")
-    pending = get_pending_invoices()
+    pending, usd_total, tbc_count = get_pending_invoices()
     if pending:
         lines.append(f"Pending инвойсов: {len(pending)}")
         lines.extend(pending[:5])
         if len(pending) > 5:
             lines.append(f"  ...и ещё {len(pending)-5}")
+        tbc_note = f" + {tbc_count} с суммой TBC" if tbc_count else ""
+        lines.append(f"  Итого к оплате: ~${usd_total:,.0f} USD{tbc_note}")
     unknown = get_unknown_transactions()
     if unknown:
         lines.append(f"Неизвестных транзакций: {len(unknown)}")
@@ -154,18 +156,28 @@ def get_balance_from_excel():
         log.error(f"Excel balance: {e}"); return None
 
 def get_pending_invoices():
-    if not EXCEL_FILE.exists(): return []
+    """Returns (lines, usd_total, tbc_count) for all non-paid invoices."""
+    if not EXCEL_FILE.exists(): return [], 0.0, 0
     try:
         wb = load_workbook(EXCEL_FILE, data_only=True)
         ws = wb["Invoices"]
         out = []
+        usd_total = 0.0
+        tbc_count = 0
         for row in ws.iter_rows(min_row=5, max_col=10, values_only=True):
-            if row[6] and "Pending" in str(row[6]):
-                amt = f"{row[4]:,.2f}" if isinstance(row[4], (int,float)) else str(row[4] or "TBC")
-                out.append(f"- {row[2] or '?'}: {amt} {row[3] or ''}")
-        return out
+            if row[6] and row[6] != "✅ Paid" and row[0]:
+                amt     = f"{row[4]:,.2f}" if isinstance(row[4], (int,float)) else str(row[4] or "TBC")
+                usd_val = row[5]  # F = USD Equiv (data_only=True reads calculated value)
+                if isinstance(usd_val, (int, float)):
+                    usd_str = f" ≈ ${usd_val:,.0f}"
+                    usd_total += usd_val
+                else:
+                    usd_str = " (USD TBC)"
+                    tbc_count += 1
+                out.append(f"- {row[2] or '?'}: {amt} {row[3] or ''}{usd_str}")
+        return out, usd_total, tbc_count
     except Exception as e:
-        log.error(f"Excel pending: {e}"); return []
+        log.error(f"Excel pending: {e}"); return [], 0.0, 0
 
 
 def get_recent_unconfirmed(days=14):
@@ -1307,9 +1319,11 @@ async def cmd_balance(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Баланс не найден. Попробуй /update")
 
 async def cmd_pending(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    pending = get_pending_invoices()
-    text = f"ОЖИДАЮТ ОПЛАТЫ ({len(pending)}):\n\n" + (
-        "\n".join(pending) if pending else "нет")
+    pending, usd_total, tbc_count = get_pending_invoices()
+    tbc_note = f"\n(+ {tbc_count} инвойс(ов) с суммой TBC)" if tbc_count else ""
+    text = (f"ОЖИДАЮТ ОПЛАТЫ ({len(pending)}):\n\n" +
+            ("\n".join(pending) if pending else "нет") +
+            (f"\n\nИТОГО: ~${usd_total:,.0f} USD{tbc_note}" if pending else ""))
     await update.message.reply_text(text)
 
 async def cmd_unknown(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1454,14 +1468,17 @@ async def _send_report(bot: Bot, triggered_manually=False):
 
     result  = get_balance_from_excel()
     bal_str = f"${result[0]:,.2f} USD (запись: {result[1]})" if result else "нет данных"
-    pending = get_pending_invoices()
+    pending, usd_total, tbc_count = get_pending_invoices()
     unknown = get_unknown_transactions()
+    tbc_note = f"\n  (+ {tbc_count} инвойс(ов) с суммой TBC — не включены)" if tbc_count else ""
+    pending_total_str = f"\nИТОГО К ОПЛАТЕ: ~${usd_total:,.0f} USD{tbc_note}"
 
     text = (f"ОТЧЁТ — {today}\n\n"
             f"{updates_text}"
             f"БАЛАНС: {bal_str}\n\n"
             f"ОЖИДАЮТ ОПЛАТЫ ({len(pending)}):\n"
             + ("\n".join(pending) if pending else "нет") +
+            (pending_total_str if pending else "") +
             f"\n\nНЕИЗВЕСТНЫЕ ({len(unknown)}):\n"
             + ("\n".join(unknown) if unknown else "нет"))
 
