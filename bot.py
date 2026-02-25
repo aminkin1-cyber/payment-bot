@@ -130,6 +130,25 @@ def get_pending_invoices():
     except Exception as e:
         log.error(f"Excel pending: {e}"); return []
 
+
+def get_recent_unconfirmed(days=14):
+    """Get recent Cash In / Deposits that might not be confirmed by agent yet."""
+    if not EXCEL_FILE.exists(): return []
+    try:
+        wb = load_workbook(EXCEL_FILE, data_only=True)
+        ws = wb["Transactions"]
+        items = []
+        for row in ws.iter_rows(min_row=5, max_col=12, values_only=True):
+            if row[1] in ("Cash In", "Deposit") and row[0]:
+                note = str(row[11] or "").lower()
+                # Flag as potentially unconfirmed if notes say so or if recent
+                if "unconfirmed" in note or "follow up" in note or "not confirm" in note:
+                    amt = f"{row[5]:,.2f}" if isinstance(row[5],(int,float)) else str(row[5])
+                    items.append(f"- {row[0]}: {row[2] or ''} | {amt} {row[4] or ''} | ПРИМЕЧАНИЕ: {row[11]}")
+        return items
+    except Exception as e:
+        log.error(f"get_recent_unconfirmed error: {e}"); return []
+
 def get_unknown_transactions():
     if not EXCEL_FILE.exists(): return []
     try:
@@ -324,8 +343,18 @@ async def ask_claude(prompt: str, system: str = None) -> str:
 
 async def parse_messages(msgs_text: str) -> dict:
     context = load_context()
+    excel_bal = get_balance_from_excel()
+    bal_str = f"${excel_bal[0]:,.2f} (запись: {excel_bal[1]})" if excel_bal else "нет данных"
+    unconfirmed = get_recent_unconfirmed()
+    unconfirmed_str = "\n".join(unconfirmed) if unconfirmed else "нет"
+
     prompt = f"""КОНТЕКСТ ПРОЕКТА (обязательно учитывай):
 {context}
+
+ТЕКУЩИЙ БАЛАНС В EXCEL: {bal_str}
+
+НЕПОДТВЕРЖДЁННЫЕ ТРАНЗАКЦИИ (мы отправили, агент ещё не подтвердил):
+{unconfirmed_str}
 
 ---
 Из новых сообщений от финансового агента извлеки структурированные данные.
@@ -383,6 +412,17 @@ async def parse_messages(msgs_text: str) -> dict:
 - ДЕДУПЛИКАЦИЯ: в new_invoices — объединяй дубли, одна запись на один инвойс
 - Несколько сообщений об одном событии = одна запись
 
+ЛОГИКА СВЕРКИ БАЛАНСА (если агент прислал остаток):
+1. agent_stated_balance — сумма из сообщения агента в USD
+2. our_excel_balance — последний баланс из Excel (из контекста)
+3. difference = our_excel_balance - agent_stated_balance (положительное = мы считаем больше чем агент)
+4. difference_explained_by — список транзакций из "НЕПОДТВЕРЖДЁННЫЕ ТРАНЗАКЦИИ" которые объясняют разницу.
+   Пример: мы отправили $150k, агент ещё не подтвердил → это объясняет $150k разницы.
+   Формат: ["$150,000 USD отправлено 24.02 — агент не подтвердил (Pacs.008)"]
+5. unexplained_difference = difference минус сумма объяснённых транзакций
+   Если unexplained_difference близко к 0 — всё сходится.
+   Если большое — есть реальное расхождение которое надо уточнять у агента.
+
 Новые сообщения:
 {msgs_text}"""
 
@@ -423,12 +463,23 @@ def format_confirmation(data: dict) -> str:
 
     rec = data.get("balance_reconciliation", {})
     if rec.get("agent_stated_balance"):
-        lines.append(f"\nБАЛАНС ОТ АГЕНТА: {rec['agent_stated_balance']}")
-        excel_bal = get_balance_from_excel()
-        if excel_bal:
-            lines.append(f"БАЛАНС В EXCEL: ${excel_bal[0]:,.2f}")
-        if rec.get("discrepancies"):
-            lines.append("РАСХОЖДЕНИЯ: " + "; ".join(rec["discrepancies"]))
+        lines.append(f"\nСВЕРКА БАЛАНСА:")
+        lines.append(f"  Агент: {rec.get('agent_stated_balance','?')}")
+        lines.append(f"  Excel: {rec.get('our_excel_balance','?')}")
+        diff = rec.get("difference")
+        if diff is not None:
+            lines.append(f"  Разница: {diff:+,.2f}" if isinstance(diff,(int,float)) else f"  Разница: {diff}")
+        explained = rec.get("difference_explained_by", [])
+        if explained:
+            lines.append("  Объясняется:")
+            for e in explained:
+                lines.append(f"    → {e}")
+        unexplained = rec.get("unexplained_difference")
+        if unexplained is not None:
+            if isinstance(unexplained,(int,float)) and abs(float(unexplained)) < 1000:
+                lines.append("  Необъяснённый остаток: ~0 ✅ Сходится!")
+            else:
+                lines.append(f"  Необъяснённый остаток: {unexplained} ⚠ Уточнить у агента!")
 
     if not txs and not upds and not invs:
         lines.append("Новых транзакций или инвойсов не найдено.")
