@@ -16,7 +16,7 @@ ANTHROPIC_KEY  = os.environ["ANTHROPIC_KEY"]
 MY_CHAT_ID     = int(os.environ["MY_CHAT_ID"])
 MORNING_HOUR   = int(os.environ.get("MORNING_HOUR", "9"))
 DATA_FILE      = Path("data/messages.json")
-EXCEL_FILE     = Path("data/Agent_Model_v2.xlsx")
+EXCEL_FILE     = Path("Agent_Model_v2.xlsx")
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
