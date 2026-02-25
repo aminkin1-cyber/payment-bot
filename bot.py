@@ -568,14 +568,36 @@ async def cmd_clear(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg: return
-    log.info(f"MSG chat_id={msg.chat_id} expected={MY_CHAT_ID} fwd={msg.forward_from} fwd_name={msg.forward_sender_name}")
     if msg.chat_id != MY_CHAT_ID:
-        log.info(f"IGNORED chat_id={msg.chat_id}")
+        log.info(f"IGNORED chat_id={msg.chat_id} expected={MY_CHAT_ID}")
         return
     text     = msg.text or msg.caption or ""
-    sender   = (msg.forward_from.full_name if msg.forward_from
-                else msg.forward_sender_name or "")
-    date_str = (msg.forward_date or msg.date).strftime("%d.%m.%Y %H:%M")
+    # Handle both old and new telegram-bot API forward attributes
+    sender = ""
+    try:
+        origin = msg.forward_origin
+        if origin:
+            if hasattr(origin, "sender_name"):
+                sender = origin.sender_name or ""
+            elif hasattr(origin, "sender_user"):
+                u = origin.sender_user
+                sender = (u.full_name or u.username or "") if u else ""
+            elif hasattr(origin, "chat"):
+                c = origin.chat
+                sender = (c.title or c.username or "") if c else ""
+    except Exception:
+        pass
+    if not sender:
+        try:
+            sender = msg.forward_sender_name or ""
+        except Exception:
+            sender = ""
+    date_str = msg.date.strftime("%d.%m.%Y %H:%M")
+    try:
+        if msg.forward_date:
+            date_str = msg.forward_date.strftime("%d.%m.%Y %H:%M")
+    except Exception:
+        pass
     file_n   = msg.document.file_name if msg.document else ""
     save_message({"date": date_str, "sender": sender,
                   "text": text, "file": file_n})
