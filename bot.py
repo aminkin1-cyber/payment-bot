@@ -567,7 +567,11 @@ async def cmd_clear(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── Message handler ───────────────────────────────────────────────────────────
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.message
-    if msg.chat_id != MY_CHAT_ID: return
+    if not msg: return
+    log.info(f"MSG chat_id={msg.chat_id} expected={MY_CHAT_ID} fwd={msg.forward_from} fwd_name={msg.forward_sender_name}")
+    if msg.chat_id != MY_CHAT_ID:
+        log.info(f"IGNORED chat_id={msg.chat_id}")
+        return
     text     = msg.text or msg.caption or ""
     sender   = (msg.forward_from.full_name if msg.forward_from
                 else msg.forward_sender_name or "")
