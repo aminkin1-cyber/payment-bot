@@ -68,6 +68,43 @@ def update_context_after_update(new_info: str):
     ctx += f"\n\n--- ОБНОВЛЕНИЕ {ts} ---\n{new_info}"
     save_context(ctx)
 
+
+CHAT_HISTORY_FILE = Path("data/chat_history.json")
+MAX_HISTORY = 8  # keep last 8 exchanges
+
+def load_chat_history():
+    CHAT_HISTORY_FILE.parent.mkdir(exist_ok=True)
+    return json.loads(CHAT_HISTORY_FILE.read_text(encoding="utf-8")) if CHAT_HISTORY_FILE.exists() else []
+
+def save_chat_history(history: list):
+    # Keep only last MAX_HISTORY exchanges
+    if len(history) > MAX_HISTORY * 2:
+        history = history[-(MAX_HISTORY * 2):]
+    CHAT_HISTORY_FILE.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
+
+def clear_chat_history():
+    if CHAT_HISTORY_FILE.exists(): CHAT_HISTORY_FILE.unlink()
+
+def get_excel_summary() -> str:
+    """Get compact Excel state for chat context."""
+    lines = []
+    bal = get_balance_from_excel()
+    if bal:
+        lines.append(f"Баланс агента: ${bal[0]:,.2f} USD (на {bal[1]})")
+    pending = get_pending_invoices()
+    if pending:
+        lines.append(f"Pending инвойсов: {len(pending)}")
+        lines.extend(pending[:5])
+        if len(pending) > 5:
+            lines.append(f"  ...и ещё {len(pending)-5}")
+    unknown = get_unknown_transactions()
+    if unknown:
+        lines.append(f"Неизвестных транзакций: {len(unknown)}")
+    queue = load_messages()
+    if queue:
+        lines.append(f"Накоплено сообщений от агента: {len(queue)} (для /update)")
+    return "\n".join(lines) if lines else "Excel не найден"
+
 # ── Message store ─────────────────────────────────────────────────────────────
 def load_messages():
     DATA_FILE.parent.mkdir(exist_ok=True)
@@ -148,6 +185,21 @@ def get_recent_unconfirmed(days=14):
         return items
     except Exception as e:
         log.error(f"get_recent_unconfirmed error: {e}"); return []
+
+
+def get_existing_invoices_list():
+    """Return list of existing invoice IDs and payees for dedup check."""
+    if not EXCEL_FILE.exists(): return ""
+    try:
+        wb = load_workbook(EXCEL_FILE, data_only=True)
+        wi = wb["Invoices"]
+        lines = []
+        for row in wi.iter_rows(min_row=5, values_only=True):
+            if row[1] or row[2]:
+                lines.append(f"inv={row[1] or '?'} | payee={row[2] or '?'} | ccy={row[3]} | amt={row[4]} | status={row[6]}")
+        return "\n".join(lines)
+    except Exception as e:
+        log.error(f"get_existing_invoices: {e}"); return ""
 
 def get_unknown_transactions():
     if not EXCEL_FILE.exists(): return []
@@ -401,6 +453,7 @@ async def parse_messages(msgs_text: str) -> dict:
     bal_str = f"${excel_bal[0]:,.2f} (запись: {excel_bal[1]})" if excel_bal else "нет данных"
     unconfirmed = get_recent_unconfirmed()
     unconfirmed_str = "\n".join(unconfirmed) if unconfirmed else "нет"
+    existing_inv = get_existing_invoices_list()
 
     prompt = f"""КОНТЕКСТ ПРОЕКТА (обязательно учитывай):
 {context}
@@ -409,6 +462,9 @@ async def parse_messages(msgs_text: str) -> dict:
 
 НЕПОДТВЕРЖДЁННЫЕ ТРАНЗАКЦИИ (мы отправили, агент ещё не подтвердил):
 {unconfirmed_str}
+
+УЖЕ СУЩЕСТВУЮЩИЕ ИНВОЙСЫ В EXCEL (НЕ добавляй их снова!):
+{existing_inv}
 
 ---
 Из новых сообщений от финансового агента извлеки структурированные данные.
@@ -571,21 +627,25 @@ def format_confirmation(data: dict) -> str:
 # ── Commands ──────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Привет! Я трекер платежей с памятью.\n\n"
-        "Пересылай мне сообщения от агента, потом:\n\n"
-        "/update  — обработать и показать что нашёл (с подтверждением)\n"
-        "/edit  — добавить, изменить или удалить запись в Excel\n"
-        "/add   — то же самое (псевдоним /edit)\n"
-        "/delete  — удалить последнюю строку из транзакций\n"
-        "/edit    — редактировать любую строку: получатель, валюта, статус, примечания\n"
-        "/balance — баланс из Excel\n"
-        "/pending — что висит\n"
+        "Привет! Я ассистент по платежам.\n\n"
+        "Просто пиши мне — я понимаю обычный текст:\n"
+        "  'какой баланс?'\n"
+        "  'покажи pending инвойсы дороже $10k'\n"
+        "  'добавь транзакцию: получили 10000 EUR наличными'\n"
+        "  'исправь получателя в последней строке'\n\n"
+        "Пересылай сообщения от агента → /update.\n\n"
+        "Команды:\n"
+        "/update  — обработать накопленные сообщения\n"
+        "/edit    — изменить строку в Excel\n"
+        "/delete  — удалить последнюю транзакцию\n"
+        "/balance — текущий баланс\n"
+        "/pending — неоплаченные инвойсы\n"
         "/unknown — неизвестные транзакции\n"
         "/summary — полный отчёт\n"
         "/excel   — скачать Excel\n"
-        "/context — посмотреть контекст\n"
-        "/clear   — очистить накопленные сообщения"
+        "/clear   — очистить очередь сообщений"
     )
+
 
 async def cmd_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msgs = load_messages()
@@ -683,6 +743,50 @@ async def callback_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     data = load_pending()
     if not data:
         await query.edit_message_text("Нет данных для записи.")
+        return
+
+    # Handle chat action
+    if data.get("type") == "chat_action":
+        action = data.get("action","")
+        params = data.get("params",{})
+        try:
+            if action == "add_transaction":
+                tx_data = {"new_transactions":[params],"invoice_updates":[],"new_invoices":[]}
+                write_to_excel(tx_data)
+                msg2 = f"Транзакция добавлена."
+            elif action == "add_invoice":
+                tx_data = {"new_transactions":[],"invoice_updates":[],"new_invoices":[params]}
+                write_to_excel(tx_data)
+                msg2 = f"Инвойс добавлен."
+            elif action in ("edit_transaction","edit_invoice"):
+                sheet = "Transactions" if action == "edit_transaction" else "Invoices"
+                edit_data = {"type":"edit","sheet":sheet,
+                             "action":"update",
+                             "row_number":params.get("row_number"),
+                             "changes":params.get("changes",{}),
+                             "description":data.get("preview","")}
+                msg2 = apply_edit(edit_data)
+            elif action == "delete_transaction":
+                edit_data = {"type":"edit","sheet":"Transactions",
+                             "action":"delete",
+                             "row_number":params.get("row_number"),
+                             "changes":{},
+                             "description":data.get("preview","")}
+                msg2 = apply_edit(edit_data)
+            else:
+                msg2 = f"Неизвестное действие: {action}"
+        except Exception as e:
+            await query.edit_message_text(f"Ошибка: {e}"); return
+
+        clear_pending()
+        await query.edit_message_text(msg2)
+        if EXCEL_FILE.exists():
+            await ctx.bot.send_document(
+                chat_id=MY_CHAT_ID,
+                document=EXCEL_FILE.open("rb"),
+                filename=f"Agent_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+                caption="Excel обновлён"
+            )
         return
 
     # Handle /edit command
@@ -897,6 +1001,112 @@ async def cmd_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await cmd_edit(update, ctx)
 
 
+
+async def handle_chat(update: Update, ctx: ContextTypes.DEFAULT_TYPE, user_text: str):
+    """Handle free-form user messages as AI conversation."""
+    context    = load_context()
+    excel_sum  = get_excel_summary()
+    history    = load_chat_history()
+    existing_inv = get_existing_invoices_list()
+
+    # Build messages for Claude
+    system_prompt = f"""Ты финансовый ассистент для трекера платежей через агента.
+Отвечай по-русски, кратко и по делу.
+Ты можешь:
+- Отвечать на вопросы о балансе, инвойсах, транзакциях
+- Вносить изменения в Excel (добавить транзакцию, изменить инвойс, удалить строку)
+- Анализировать ситуацию и давать рекомендации
+
+ТЕКУЩЕЕ СОСТОЯНИЕ EXCEL:
+{excel_sum}
+
+УЖЕ СУЩЕСТВУЮЩИЕ ИНВОЙСЫ:
+{existing_inv}
+
+КОНТЕКСТ ПРОЕКТА:
+{context}
+
+Если пользователь просит ДЕЙСТВИЕ (добавить/изменить/удалить) — ответь JSON:
+{{
+  "type": "action",
+  "action": "add_transaction|add_invoice|edit_transaction|edit_invoice|delete_transaction",
+  "params": {{...}},
+  "preview": "одна строка — что именно сделаем",
+  "message": "текст ответа пользователю"
+}}
+
+Если просто ВОПРОС или разговор — ответь JSON:
+{{
+  "type": "text",
+  "message": "твой ответ"
+}}
+
+Параметры для add_transaction:
+  date, type(Payment|Deposit|Cash Out|Cash In|❓ Unknown), description, payee, ccy, amount, fx_rate(null), comm(null), notes
+
+Параметры для add_invoice:
+  date, invoice_no, payee, ccy, amount, status(⏳ Pending), notes
+
+Параметры для edit_transaction/edit_invoice:
+  row_number, changes: {{col_X: value, ...}}
+  Transactions: col_A=Date,col_B=Type,col_C=Desc,col_D=Payee,col_E=CCY,col_F=Amt,col_G=FX,col_H=GrossUSD,col_I=Comm%,col_J=NetUSD,col_K=Bal,col_L=Notes
+  Invoices: col_A=Date,col_B=InvNo,col_C=Payee,col_D=CCY,col_E=Amt(ЧИСЛО!),col_F=USD,col_G=Status,col_H=DatePaid,col_I=Ref,col_J=Notes
+
+Параметры для delete_transaction:
+  row_number"""
+
+    messages = []
+    # Add history
+    for h in history:
+        messages.append(h)
+    # Add current message
+    messages.append({"role": "user", "content": user_text})
+
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": ANTHROPIC_KEY,
+                         "anthropic-version": "2023-06-01",
+                         "content-type": "application/json"},
+                json={"model": "claude-opus-4-6", "max_tokens": 1500,
+                      "system": system_prompt, "messages": messages},
+            )
+            raw = r.json()["content"][0]["text"].strip().strip("`").strip()
+            if raw.startswith("json"): raw = raw[4:].strip()
+            data = json.loads(raw)
+    except Exception as e:
+        log.error(f"Chat error: {e}")
+        await update.message.reply_text(f"Ошибка: {e}")
+        return
+
+    msg_text = data.get("message", "")
+    response_type = data.get("type", "text")
+
+    if response_type == "action":
+        action   = data.get("action","")
+        params   = data.get("params", {})
+        preview  = data.get("preview","")
+
+        # Save pending action
+        pending_data = {"type": "chat_action", "action": action,
+                        "params": params, "preview": preview}
+        save_pending(pending_data)
+
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Применить", callback_data="confirm_update"),
+             InlineKeyboardButton("❌ Отмена",    callback_data="cancel_update")]
+        ])
+        reply = f"{msg_text}\n\n📋 {preview}"
+        await update.message.reply_text(reply, reply_markup=keyboard)
+    else:
+        await update.message.reply_text(msg_text)
+
+    # Save to history
+    history.append({"role": "user",      "content": user_text})
+    history.append({"role": "assistant", "content": msg_text})
+    save_chat_history(history)
+
 async def cmd_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Delete last N rows from Transactions sheet. Usage: /delete or /delete 2"""
     n = 1
@@ -1032,9 +1242,16 @@ async def cmd_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 - row_number: точный номер строки Excel (начиная с 5)
 - changes: только те колонки которые нужно изменить, остальные null
 - action=delete: удалить строку целиком
-- Для Invoices используй col_A..col_J (10 колонок)
 - Если команда непонятна или строка не найдена — верни {{"error": "описание проблемы"}}
-- Не пересчитывай баланс — только меняй указанные поля"""
+- Не пересчитывай баланс — только меняй указанные поля
+
+КОЛОНКИ Transactions: col_A=Date, col_B=Type, col_C=Description, col_D=Payee, col_E=CCY, col_F=Amount(число), col_G=FX, col_H=GrossUSD, col_I=Comm%, col_J=NetUSD, col_K=Balance, col_L=Notes
+КОЛОНКИ Invoices: col_A=Date, col_B=InvNo, col_C=Payee, col_D=CCY(валюта), col_E=Amount(ЧИСЛО!), col_F=USD_equiv, col_G=Status, col_H=DatePaid, col_I=Ref, col_J=Notes
+
+ВАЖНО для Invoices:
+- col_D = валюта (AED/USD/EUR/etc) — СТРОКА
+- col_E = сумма — ЧИСЛО (например 242022.05, не "AED"!)
+- Никогда не пиши валюту в col_E — только число"""
 
     await update.message.reply_text("Анализирую команду...")
 
@@ -1140,6 +1357,17 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         log.info(f"IGNORED chat_id={msg.chat_id} expected={MY_CHAT_ID}")
         return
     text     = msg.text or msg.caption or ""
+
+    # If NOT a forwarded message and NOT a document — treat as chat
+    is_forwarded = bool(
+        getattr(msg, "forward_origin", None) or
+        getattr(msg, "forward_sender_name", None) or
+        getattr(msg, "forward_from", None)
+    )
+    if not is_forwarded and not msg.document and text:
+        await handle_chat(update, ctx, text)
+        return
+
     # Handle both old and new telegram-bot API forward attributes
     sender = ""
     try:
@@ -1255,7 +1483,6 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
     for cmd, fn in [
         ("start", cmd_start), ("update", cmd_update),
-        ("add", cmd_add),
         ("edit", cmd_edit),
         ("delete", cmd_delete),
         ("edit", cmd_edit),
