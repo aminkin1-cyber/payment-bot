@@ -10,6 +10,12 @@ from datetime import datetime, time
 from pathlib import Path
 import httpx
 from openpyxl import load_workbook
+import io
+try:
+    from pypdf import PdfReader
+    HAS_PDF = True
+except ImportError:
+    HAS_PDF = False
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from telegram import Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (Application, MessageHandler, CommandHandler,
@@ -75,11 +81,15 @@ def clear_messages():
     DATA_FILE.write_text("[]", encoding="utf-8")
 
 def _fmt(msgs):
-    return "\n".join(
-        f"[{m['date']}] {m.get('sender','?')}: {m.get('text','')} "
-        f"{'[файл: '+m['file']+']' if m.get('file') else ''}"
-        for m in msgs
-    )
+    lines = []
+    for m in msgs:
+        line = f"[{m['date']}] {m.get('sender','?')}:"
+        if m.get("text"): line += f" {m['text']}"
+        if m.get("file"): line += f" [файл: {m['file']}]"
+        if m.get("pdf_content"):
+            line += f"\n  [СОДЕРЖИМОЕ PDF {m['file']}]:\n  {m['pdf_content'][:2000]}"
+        lines.append(line)
+    return "\n".join(lines)
 
 # ── Pending confirmation store ────────────────────────────────────────────────
 def save_pending(data: dict):
@@ -350,6 +360,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Пересылай мне сообщения от агента, потом:\n\n"
         "/update  — обработать и показать что нашёл (с подтверждением)\n"
         "/add     — быстро добавить операцию вручную одной строкой\n"
+        "/delete  — удалить последнюю строку из транзакций\n"
         "/balance — баланс из Excel\n"
         "/pending — что висит\n"
         "/unknown — неизвестные транзакции\n"
@@ -516,6 +527,50 @@ async def cmd_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     save_pending(data)
     await update.message.reply_text(conf_text, reply_markup=keyboard)
 
+
+async def cmd_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Delete last N rows from Transactions sheet. Usage: /delete or /delete 2"""
+    n = 1
+    if ctx.args:
+        try: n = int(ctx.args[0])
+        except: pass
+    n = min(n, 5)  # max 5 at once for safety
+
+    if not EXCEL_FILE.exists():
+        await update.message.reply_text("Excel файл не найден.")
+        return
+
+    wb = load_workbook(EXCEL_FILE)
+    ws = wb["Transactions"]
+
+    deleted = []
+    for _ in range(n):
+        last = None
+        for row in ws.iter_rows(min_row=5):
+            if row[0].value is not None:
+                last = row[0].row
+        if last:
+            desc  = ws.cell(last, 3).value or ""
+            date  = ws.cell(last, 1).value or ""
+            amt   = ws.cell(last, 6).value or ""
+            ccy   = ws.cell(last, 5).value or ""
+            deleted.append(f"[{date}] {desc} | {amt} {ccy}")
+            ws.delete_rows(last)
+
+    wb.save(EXCEL_FILE)
+
+    if deleted:
+        msg_text = f"Удалено {len(deleted)} строк:\n" + "\n".join(f"- {d}" for d in deleted)
+        await update.message.reply_text(msg_text)
+        await ctx.bot.send_document(
+            chat_id=MY_CHAT_ID,
+            document=EXCEL_FILE.open("rb"),
+            filename="Agent_after_delete.xlsx",
+            caption="Excel после удаления"
+        )
+    else:
+        await update.message.reply_text("Нет строк для удаления.")
+
 async def cmd_balance(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     result = get_balance_from_excel()
     if result:
@@ -603,11 +658,36 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
     file_n   = msg.document.file_name if msg.document else ""
-    save_message({"date": date_str, "sender": sender,
-                  "text": text, "file": file_n})
+    pdf_text = ""
+
+    # Download and read PDF if attached
+    if msg.document and file_n.lower().endswith(".pdf") and HAS_PDF:
+        try:
+            tg_file = await msg.document.get_file()
+            buf = io.BytesIO()
+            await tg_file.download_to_memory(buf)
+            buf.seek(0)
+            reader = PdfReader(buf)
+            pages_text = []
+            for page in reader.pages:
+                t = page.extract_text()
+                if t: pages_text.append(t.strip())
+            pdf_text = "\n".join(pages_text)[:3000]  # limit
+            log.info(f"PDF extracted: {len(pdf_text)} chars from {file_n}")
+        except Exception as e:
+            log.error(f"PDF read error: {e}")
+            pdf_text = f"[PDF не удалось прочитать: {e}]"
+
+    entry = {"date": date_str, "sender": sender, "text": text, "file": file_n}
+    if pdf_text:
+        entry["pdf_content"] = pdf_text
+    save_message(entry)
+
     preview = text[:60] + ("…" if len(text) > 60 else "")
     parts   = [f"от {sender}"] if sender else []
-    if file_n:  parts.append(f"файл: {file_n}")
+    if file_n:
+        pdf_note = " (прочитан)" if pdf_text else ""
+        parts.append(f"файл: {file_n}{pdf_note}")
     if preview: parts.append(f'"{preview}"')
     count = len(load_messages())
     await msg.reply_text(
@@ -667,6 +747,7 @@ def main():
     for cmd, fn in [
         ("start", cmd_start), ("update", cmd_update),
         ("add", cmd_add),
+        ("delete", cmd_delete),
         ("balance", cmd_balance), ("pending", cmd_pending),
         ("unknown", cmd_unknown), ("summary", cmd_summary),
         ("excel", cmd_excel), ("context", cmd_context), ("clear", cmd_clear)
