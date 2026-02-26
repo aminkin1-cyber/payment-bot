@@ -377,32 +377,92 @@ def add_new_invoice(ws, inv, last_row):
     ws.row_dimensions[r].height = 26
 
 
+def _recalc_balance_chain(ws, from_row: int):
+    """Recompute K (Balance) for all rows from from_row downward."""
+    from openpyxl.styles import Font, PatternFill, Alignment
+    YELLOW = PatternFill("solid", fgColor="FFFFF2CC")
+    prev_bal = 0.0
+    for pr in ws.iter_rows(min_row=5, max_row=from_row-1, max_col=11, values_only=True):
+        if pr[10] is not None and isinstance(pr[10], (int, float)):
+            prev_bal = float(pr[10])
+    if prev_bal == 0.0:
+        try:
+            s = ws.parent["Settings"].cell(4, 3).value
+            if s and isinstance(s, (int, float)): prev_bal = float(s)
+        except: pass
+    for r_cells in ws.iter_rows(min_row=from_row, max_col=11):
+        r = r_cells[0].row
+        if not ws.cell(r, 1).value: break
+        net_val = ws.cell(r, 10).value
+        try: net = float(net_val) if isinstance(net_val, (int, float)) else 0.0
+        except: net = 0.0
+        new_bal = round(prev_bal + net, 2)
+        c = ws.cell(r, 11, new_bal)
+        c.number_format = "#,##0.00"; c.fill = YELLOW
+        c.font = Font(name="Arial", size=9, bold=True, color="1F3864")
+        c.alignment = Alignment(horizontal="right", vertical="center")
+        prev_bal = new_bal
+
+
 def apply_transaction_update(ws, upd):
-    """Update notes/status of existing transaction row by matching description."""
+    """Update notes/status/fx_rate of existing transaction row by matching description."""
     match_desc = str(upd.get("match_description","")).lower()
     match_date = str(upd.get("match_date","")).strip()
     new_notes  = upd.get("new_notes","")
     confirmed  = upd.get("confirmed", False)
+    new_fx     = upd.get("fx_rate")
 
     if not match_desc:
         return False
 
     for row in ws.iter_rows(min_row=5):
         r = row[0].row
-        desc = str(ws.cell(r,3).value or "").lower()
-        date = str(ws.cell(r,1).value or "")
+        desc  = str(ws.cell(r,3).value or "").lower()
+        date  = str(ws.cell(r,1).value or "")
         notes = str(ws.cell(r,12).value or "")
 
-        # Match by keywords in description
         keywords = [w for w in match_desc.split() if len(w) > 3]
-        matches = sum(1 for kw in keywords if kw in desc or kw in notes.lower())
+        matches  = sum(1 for kw in keywords if kw in desc or kw in notes.lower())
 
         if matches >= 1:
-            # Also check date if provided
             if match_date and match_date not in date:
                 continue
 
-            # Update notes — remove UNCONFIRMED warning, add confirmation
+            # FX rate correction with full recalculation
+            if new_fx:
+                try:
+                    from openpyxl.styles import Font, PatternFill, Alignment
+                    YELLOW = PatternFill("solid", fgColor="FFFFF2CC")
+                    fx    = float(new_fx)
+                    amt   = float(ws.cell(r, 6).value or 0)
+                    tp    = str(ws.cell(r, 2).value or "")
+                    comm  = float(ws.cell(r, 9).value or 0)
+                    gross = round(amt / fx, 2) if fx else amt
+                    net   = round(gross, 2) if tp in ("Deposit","Cash In") else round(-(gross/max(1-comm,0.0001)),2)
+
+                    c = ws.cell(r, 7, round(fx, 5))
+                    c.number_format="0.00000"; c.fill=YELLOW
+                    c.font=Font(name="Arial",size=9,color="0000CC")
+                    c.alignment=Alignment(horizontal="right",vertical="center")
+
+                    c = ws.cell(r, 8, gross)
+                    c.number_format="#,##0.00"; c.fill=YELLOW
+                    c.font=Font(name="Arial",size=9)
+                    c.alignment=Alignment(horizontal="right",vertical="center")
+
+                    c = ws.cell(r, 10, round(net, 2))
+                    c.number_format="#,##0.00"; c.fill=YELLOW
+                    c.font=Font(name="Arial",size=9)
+                    c.alignment=Alignment(horizontal="right",vertical="center")
+
+                    _recalc_balance_chain(ws, r)
+                    notes = notes.replace("⏳ ПРЕДВ. КУРС","").replace("⏳ PRELIMINARY RATE","").strip(" |")
+                    notes += f" | Курс подтверждён агентом: {fx}"
+                    log.info(f"FX rate updated row {r}: fx={fx}, gross={gross}, net={net}")
+                except Exception as e:
+                    log.error(f"FX rate update error: {e}")
+
+            # Notes / confirmation update
             updated_notes = notes
             updated_notes = updated_notes.replace("⚠ UNCONFIRMED — ", "✅ CONFIRMED — ")
             updated_notes = updated_notes.replace("Agent did NOT confirm", "Agent CONFIRMED")
@@ -414,12 +474,10 @@ def apply_transaction_update(ws, upd):
                 if "CONFIRMED" not in updated_notes.upper():
                     updated_notes += f" | Подтверждено агентом {ts}"
 
-            ws.cell(r,12).value = updated_notes.strip()
-
-            # Also update description to remove warning
+            ws.cell(r,12).value = updated_notes.strip(" |")
             cur_desc = str(ws.cell(r,3).value or "")
             if "⚠ UNCONFIRMED" in cur_desc or "UNCONFIRMED" in cur_desc:
-                ws.cell(r,3).value = cur_desc.replace("⚠ UNCONFIRMED — ", "✅ ").replace("UNCONFIRMED", "CONFIRMED")
+                ws.cell(r,3).value = cur_desc.replace("⚠ UNCONFIRMED — ","✅ ").replace("UNCONFIRMED","CONFIRMED")
 
             log.info(f"Transaction updated row {r}: {ws.cell(r,3).value}")
             return True
@@ -520,7 +578,8 @@ async def parse_messages(msgs_text: str) -> dict:
       "match_description": "ключевые слова из описания существующей транзакции",
       "match_date": "DD.MM.YYYY или пусто",
       "new_notes": "",
-      "confirmed": true
+      "confirmed": true,
+      "fx_rate": null
     }}
   ],
   "balance_reconciliation": {{
@@ -552,6 +611,14 @@ async def parse_messages(msgs_text: str) -> dict:
   В этом случае НЕ добавляй новую транзакцию! Используй transaction_updates чтобы обновить существующую строку.
   match_description = ключевые слова из описания транзакции (например "150k", "150,000 USD", "50,000 USD")
   new_notes = старые заметки + " | ПОДТВЕРЖДЕНО АГЕНТОМ [дата]"
+  confirmed = true
+
+- УТОЧНЕНИЕ КУРСА: если в транзакции стоит "⏳ ПРЕДВ. КУРС" (предварительный курс из наших настроек),
+  и агент прислал баланс с указанием фактического курса (например "SGD 110,000 = $87,500 по курсу 1.257"),
+  используй transaction_updates с fx_rate = фактический курс агента.
+  Это пересчитает H (Gross USD), J (Net USD) и всю цепочку балансов K автоматически.
+  match_description = ключевые слова суммы/описания (например "110000 SGD", "Singapore")
+  fx_rate = фактический курс числом (например 1.257)
   confirmed = true
 
 ЛОГИКА СВЕРКИ БАЛАНСА (если агент прислал остаток):
@@ -809,6 +876,14 @@ def apply_edit(data: dict) -> str:
             c.number_format = "#,##0.00"; c.fill = YELLOW
             c.font = Font(name="Arial", size=9, bold=True, color="1F3864")
             c.alignment = Alignment(horizontal="right", vertical="center")
+
+            # Mark as preliminary rate if CCY is not USD (rate may differ from agent's actual)
+            if ccy != "USD":
+                notes_cell = ws.cell(row_n, 12)
+                cur_notes = str(notes_cell.value or "")
+                if "ПРЕДВ. КУРС" not in cur_notes and "PRELIMINARY" not in cur_notes:
+                    sep = " | " if cur_notes else ""
+                    notes_cell.value = cur_notes + sep + "⏳ ПРЕДВ. КУРС — уточнить у агента"
 
             applied.append(f"G={round(fx,5)} H={gross} I={comm} J=formula K={round(prev_bal+net,2)}")
 
