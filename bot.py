@@ -372,7 +372,7 @@ def add_new_invoice(ws, inv, last_row):
         c = ws.cell(r, col_i, val if val is not None else "")
         sc(c, bg=bg, wrap=(col_i in (3,10)), sz=9)
     ws.cell(r,6).value = (f'=IF(OR(E{r}="",E{r}="TBC"),"TBC",'
-                          f'IFERROR(E{r}/VLOOKUP(D{r},Settings!$A$7:$B$16,2,FALSE),E{r}))')
+                          f'IFERROR(E{r}/VLOOKUP(D{r},Settings!$A$7:$B$17,2,FALSE),E{r}))')
     ws.cell(r,6).number_format = '#,##0.00'; sc(ws.cell(r,6), bg=bg)
     ws.row_dimensions[r].height = 26
 
@@ -739,6 +739,78 @@ def apply_edit(data: dict) -> str:
         cell.border = B()
         cell.alignment = Alignment(vertical="center", wrap_text=(col_idx in (3,12)))
         applied.append(f"{col_name}={val}")
+
+    # After writing base columns, recalculate formula columns G/H/I/J/K
+    # if this is a Transactions sheet row with amount and CCY set
+    if sheet_name == "Transactions":
+        tp  = ws.cell(row_n, 2).value or ""
+        ccy = ws.cell(row_n, 5).value or "USD"
+        try: amt = float(ws.cell(row_n, 6).value or 0)
+        except: amt = 0.0
+
+        if amt and tp:
+            # FX rate
+            fx = 1.0
+            try:
+                for srow in wb["Settings"].iter_rows(min_row=7, max_row=17, values_only=True):
+                    if srow[0] == ccy:
+                        fx = float(srow[1]); break
+            except: pass
+
+            # Comm
+            comm_map = {"Deposit":0.0,"Cash In":0.0,"Payment":0.005,"Cash Out":0.005,"❓ Unknown":0.005}
+            comm = comm_map.get(tp, 0.005)
+            try:
+                i_val = ws.cell(row_n, 9).value
+                if i_val not in (None, "", "0%"):
+                    comm = float(str(i_val).replace("%","")) / (100 if "%" in str(i_val) else 1)
+            except: pass
+
+            gross = round(amt / fx, 2) if fx else amt
+            net   = round(gross, 2) if tp in ("Deposit","Cash In") else round(-(gross/max(1-comm,0.0001)),2)
+
+            # Previous balance
+            prev_bal = 0.0
+            for pr in ws.iter_rows(min_row=5, max_row=row_n-1, max_col=11, values_only=True):
+                if pr[10] is not None and isinstance(pr[10], (int, float)):
+                    prev_bal = float(pr[10])
+            if prev_bal == 0.0:
+                try:
+                    s = wb["Settings"].cell(4, 3).value
+                    if s and isinstance(s, (int,float)): prev_bal = float(s)
+                except: pass
+
+            YELLOW = PatternFill("solid", fgColor="FFFFF2CC")
+
+            c = ws.cell(row_n, 7, round(fx, 5))
+            c.number_format = "0.00000"; c.fill = YELLOW
+            c.font = Font(name="Arial", size=9, color="0000CC")
+            c.alignment = Alignment(horizontal="right", vertical="center")
+
+            c = ws.cell(row_n, 8, gross)
+            c.number_format = "#,##0.00"; c.fill = YELLOW
+            c.font = Font(name="Arial", size=9)
+            c.alignment = Alignment(horizontal="right", vertical="center")
+
+            c = ws.cell(row_n, 9, comm)
+            c.number_format = "0.0%"; c.fill = YELLOW
+            c.font = Font(name="Arial", size=9, color="0000CC")
+            c.alignment = Alignment(horizontal="right", vertical="center")
+
+            ws.cell(row_n, 10).value = (f'=IF(H{row_n}="","",IF(OR(B{row_n}="Deposit",'
+                                        f'B{row_n}="Cash In"),H{row_n},'
+                                        f'-(H{row_n}/MAX(1-I{row_n},0.0001))))')
+            c = ws.cell(row_n, 10)
+            c.number_format = "#,##0.00"; c.fill = YELLOW
+            c.font = Font(name="Arial", size=9)
+            c.alignment = Alignment(horizontal="right", vertical="center")
+
+            c = ws.cell(row_n, 11, round(prev_bal + net, 2))
+            c.number_format = "#,##0.00"; c.fill = YELLOW
+            c.font = Font(name="Arial", size=9, bold=True, color="1F3864")
+            c.alignment = Alignment(horizontal="right", vertical="center")
+
+            applied.append(f"G={round(fx,5)} H={gross} I={comm} J=formula K={round(prev_bal+net,2)}")
 
     wb.save(EXCEL_FILE)
     return f"Применено к строке {row_n}:\n" + "\n".join(f"  {a}" for a in applied) + f"\n\n{desc}"
