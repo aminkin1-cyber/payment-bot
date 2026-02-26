@@ -32,6 +32,31 @@ CONTEXT_FILE = Path("data/context.txt")
 PENDING_FILE = Path("data/pending_update.json")  # stores parsed data awaiting confirmation
 
 logging.basicConfig(level=logging.INFO)
+
+def _ensure_settings_usdt():
+    """Add USDT=1.0 to Settings FX table if not present."""
+    if not EXCEL_FILE.exists(): return
+    try:
+        wb = load_workbook(EXCEL_FILE)
+        ws = wb["Settings"]
+        # Check if USDT already there
+        for row in ws.iter_rows(min_row=7, max_row=20, values_only=True):
+            if row[0] == "USDT": return
+        # Add after last FX entry
+        for r in range(7, 25):
+            if not ws.cell(r, 1).value:
+                ws.cell(r, 1).value = "USDT"
+                ws.cell(r, 2).value = 1.0
+                from openpyxl.styles import Font, Alignment
+                ws.cell(r, 1).font = Font(name="Arial", size=9)
+                ws.cell(r, 2).font = Font(name="Arial", size=9)
+                ws.cell(r, 2).alignment = Alignment(horizontal="right")
+                wb.save(EXCEL_FILE)
+                log.info("Added USDT=1.0 to Settings FX table")
+                return
+    except Exception as e:
+        log.error(f"_ensure_settings_usdt: {e}")
+
 log = logging.getLogger(__name__)
 
 # ── Styles ────────────────────────────────────────────────────────────────────
@@ -155,8 +180,22 @@ def get_balance_from_excel():
     except Exception as e:
         log.error(f"Excel balance: {e}"); return None
 
+def _compute_usd(wb, ccy, amount):
+    """Compute USD equivalent from FX Settings — no formula cache needed."""
+    if not isinstance(amount, (int, float)) or amount <= 0:
+        return None
+    fx = 1.0
+    try:
+        for row in wb["Settings"].iter_rows(min_row=7, max_row=25, values_only=True):
+            if row[0] and str(row[0]) == str(ccy) and isinstance(row[1], (int,float)):
+                fx = float(row[1]); break
+    except Exception: pass
+    return round(amount / fx, 2) if fx else amount
+
+
 def get_pending_invoices():
-    """Returns (lines, usd_total, tbc_count) for all non-paid invoices."""
+    """Returns (lines, usd_total, tbc_count) for all non-paid invoices.
+    Computes USD from Settings FX table — works even after openpyxl save clears formula cache."""
     if not EXCEL_FILE.exists(): return [], 0.0, 0
     try:
         wb = load_workbook(EXCEL_FILE, data_only=True)
@@ -165,16 +204,21 @@ def get_pending_invoices():
         usd_total = 0.0
         tbc_count = 0
         for row in ws.iter_rows(min_row=5, max_col=10, values_only=True):
-            if row[6] and row[6] != "✅ Paid" and row[0]:
-                amt     = f"{row[4]:,.2f}" if isinstance(row[4], (int,float)) else str(row[4] or "TBC")
-                usd_val = row[5]  # F = USD Equiv (data_only=True reads calculated value)
-                if isinstance(usd_val, (int, float)):
+            if row[6] and row[6] != "✅ Paid" and (row[0] or row[1]):
+                amt_raw = row[4]
+                ccy     = str(row[3] or "")
+                amt     = f"{amt_raw:,.2f}" if isinstance(amt_raw, (int,float)) else str(amt_raw or "TBC")
+                # Try F col first (may have computed number); fall back to Python calc
+                usd_val = row[5] if isinstance(row[5], (int,float)) else None
+                if usd_val is None and isinstance(amt_raw, (int,float)):
+                    usd_val = _compute_usd(wb, ccy, amt_raw)
+                if isinstance(usd_val, (int, float)) and usd_val > 0:
                     usd_str = f" ≈ ${usd_val:,.0f}"
                     usd_total += usd_val
                 else:
                     usd_str = " (USD TBC)"
                     tbc_count += 1
-                out.append(f"- {row[2] or '?'}: {amt} {row[3] or ''}{usd_str}")
+                out.append(f"- {row[2] or '?'}: {amt} {ccy}{usd_str}")
         return out, usd_total, tbc_count
     except Exception as e:
         log.error(f"Excel pending: {e}"); return [], 0.0, 0
@@ -229,16 +273,17 @@ def get_unknown_transactions():
 
 # ── Excel write ───────────────────────────────────────────────────────────────
 def find_last_row(ws, start=5):
+    """Find last data row by checking col A (date) OR col B (type/invoice_no)."""
     last = start - 1
-    for row in ws.iter_rows(min_row=start, max_col=1):
-        if row[0].value is not None:
+    for row in ws.iter_rows(min_row=start, max_col=2):
+        if row[0].value is not None or row[1].value is not None:
             last = row[0].row
     return last
 
 def _get_fx(ws_parent, ccy):
     """Lookup FX rate from Settings sheet."""
     try:
-        for row in ws_parent["Settings"].iter_rows(min_row=7, max_row=20, values_only=True):
+        for row in ws_parent["Settings"].iter_rows(min_row=7, max_row=25, values_only=True):
             if str(row[0]) == ccy and row[1]:
                 return float(row[1])
     except Exception: pass
@@ -292,87 +337,188 @@ def apply_tx_row(ws, r, tx):
     ws.cell(r,10).value = (f'=IF(H{r}="","",IF(OR(B{r}="Deposit",B{r}="Cash In"),'
                            f'H{r},-(H{r}/MAX(1-I{r},0.0001))))')
     ws.cell(r,10).number_format = '#,##0.00'; sc(ws.cell(r,10), bg=YELLOW)
-    # K: Balance — compute directly so bot can read it back
-    # Get previous balance
-    prev_bal = 0.0
-    try:
-        for pr in ws.iter_rows(min_row=5, max_row=r-1, max_col=11, values_only=True):
-            if pr[10] is not None and isinstance(pr[10], (int, float)):
-                prev_bal = float(pr[10])
-    except Exception:
-        pass
-    # Get starting balance from Settings if no previous
-    if prev_bal == 0.0:
-        try:
-            wb2 = ws.parent
-            start = wb2["Settings"].cell(4, 3).value
-            if start and isinstance(start, (int, float)):
-                prev_bal = float(start)
-        except Exception:
-            pass
-    # Compute fx_rate value
-    try:
-        fx_val = float(tx.get("fx_rate") or 1.0)
-        if not tx.get("fx_rate"):
-            # lookup from Settings
-            try:
-                ccy = tx.get("ccy","")
-                for srow in ws.parent["Settings"].iter_rows(min_row=7, max_row=16, values_only=True):
-                    if srow[0] == ccy:
-                        fx_val = float(srow[1]); break
-            except Exception:
-                fx_val = 1.0
-    except Exception:
-        fx_val = 1.0
-    try:
-        amt = float(tx.get("amount") or 0)
-        gross = amt / fx_val if fx_val else amt
-        comm_val = float(tx.get("comm") or 0)
-        if not tx.get("comm"):
-            try:
-                tp2 = tx.get("type","Payment")
-                comm_map = {"Deposit":0,"Cash In":0,"Payment":0.005,"Cash Out":0.005,"❓ Unknown":0.005}
-                comm_val = comm_map.get(tp2, 0.005)
-            except Exception:
-                comm_val = 0.005
-        tp2 = tx.get("type","Payment")
-        if tp2 in ("Deposit","Cash In"):
-            net = gross
-        else:
-            net = -(gross / max(1 - comm_val, 0.0001))
-        new_bal = prev_bal + net
-    except Exception as e:
-        new_bal = prev_bal
-
-    ws.cell(r,11).value = round(new_bal, 2)
-    ws.cell(r,11).number_format = '#,##0.00'; sc(ws.cell(r,11), bg=YELLOW, bold=True, fc="1F3864")
     ws.row_dimensions[r].height = 28
 
-def apply_inv_update(ws, upd):
-    inv_no = str(upd.get("invoice_no","")).strip().lower()
-    status = upd.get("new_status","✅ Paid")
-    bg     = STAT_BG.get(status, YELLOW)
+def _parse_date(s):
+    """Parse DD.MM.YYYY or similar to date object, return None on fail."""
+    from datetime import date as ddate
+    if not s: return None
+    for fmt in ("%d.%m.%Y", "%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y"):
+        try:
+            from datetime import datetime
+            return datetime.strptime(str(s).strip(), fmt).date()
+        except: pass
+    return None
+
+
+def _find_duplicate_tx(wst, payee: str, ccy: str, amount: float, date_str: str) -> int | None:
+    """
+    Check if Transactions already has a similar Payment row.
+    Returns row number if duplicate found, else None.
+    Match criteria: same payee (fuzzy) + same CCY + amount within 1% + date within 10 days.
+    """
+    from datetime import timedelta
+    ref_date = _parse_date(date_str)
+    payee_lo = (payee or "").lower().strip()
+
+    for row_idx, row in enumerate(wst.iter_rows(min_row=5, max_col=12, values_only=True), start=5):
+        if not row[0]: continue
+        r_type = str(row[1] or "")
+        if r_type not in ("Payment", "Deposit"): continue
+
+        # Payee match (partial)
+        r_payee = str(row[3] or "").lower()
+        r_desc  = str(row[2] or "").lower()
+        payee_words = [w for w in payee_lo.split() if len(w) > 3]
+        payee_match = any(w in r_payee or w in r_desc for w in payee_words) if payee_words else False
+
+        # CCY + amount match (within 1%)
+        r_ccy = str(row[4] or "")
+        try: r_amt = float(row[5] or 0)
+        except: r_amt = 0.0
+        amt_match = (r_ccy == ccy and amount > 0 and abs(r_amt - amount) / max(amount, 1) < 0.01)
+
+        # Date proximity (within 10 days)
+        date_match = True
+        if ref_date:
+            r_date = _parse_date(row[0])
+            if r_date:
+                date_match = abs((r_date - ref_date).days) <= 10
+
+        if payee_match and amt_match and date_match:
+            return row_idx
+    return None
+
+
+def _flag_duplicate(wst, row_a: int, row_b: int):
+    """Mark two rows as possible duplicates in their Notes column."""
+    ORANGE = PatternFill("solid", fgColor="FFFCE4D6")
+    for r in (row_a, row_b):
+        if r is None: continue
+        c = wst.cell(r, 12)
+        cur = str(c.value or "")
+        if "POSSIBLE DUPLICATE" not in cur:
+            c.value = (cur + " | ⚠ POSSIBLE DUPLICATE — проверить!").strip(" |")
+        c.fill = ORANGE
+        c.font = Font(name="Arial", size=8, color="FF843C0C", bold=True)
+
+
+def apply_inv_update(ws, upd, wst=None):
+    """
+    Mark invoice as paid AND auto-create a Payment transaction if not already exists.
+    Returns (found: bool, tx_created: bool, duplicate_row: int|None)
+    """
+    inv_no  = str(upd.get("invoice_no","")).strip().lower()
+    status  = upd.get("new_status","✅ Paid")
+    bg      = STAT_BG.get(status, YELLOW)
+
     for row in ws.iter_rows(min_row=5, max_col=10):
-        if inv_no and inv_no in str(row[1].value or "").strip().lower():
-            row[6].value = status; sc(row[6], bg=bg, bold=True, align="center")
-            row[7].value = upd.get("date_paid",""); sc(row[7], bg=bg)
-            if upd.get("ref"): row[8].value = upd["ref"]; sc(row[8], bg=bg, sz=8)
-            return True
-    return False
+        if not (inv_no and inv_no in str(row[1].value or "").strip().lower()):
+            continue
+
+        # ── Update invoice status ─────────────────────────────────────────
+        row[6].value = status; sc(row[6], bg=bg, bold=True, align="center")
+        date_paid = upd.get("date_paid",""); row[7].value = date_paid; sc(row[7], bg=bg)
+        ref = upd.get("ref","")
+        if ref: row[8].value = ref; sc(row[8], bg=bg, sz=8)
+
+        # ── Only auto-create transaction when marking as Paid ────────────
+        if status != "✅ Paid" or wst is None:
+            return True, False, None
+
+        # Determine amount/ccy: SWIFT > invoice > fallback
+        swift_amt  = upd.get("swift_amount")
+        swift_ccy  = upd.get("swift_ccy")
+        swift_date = upd.get("swift_date") or date_paid
+
+        inv_ccy    = str(row[3].value or "")
+        try: inv_amt = float(row[4].value or 0)
+        except: inv_amt = 0.0
+
+        if swift_amt and swift_ccy:
+            tx_amt = float(swift_amt); tx_ccy = swift_ccy; tx_date = swift_date
+            src = "SWIFT"
+        elif inv_amt:
+            tx_amt = inv_amt; tx_ccy = inv_ccy; tx_date = date_paid
+            src = "инвойс"
+        else:
+            return True, False, None  # no amount at all — skip
+
+        payee = str(row[2].value or "")
+
+        # ── Dedup check ───────────────────────────────────────────────────
+        dup_row = _find_duplicate_tx(wst, payee, tx_ccy, tx_amt, tx_date)
+        if dup_row:
+            # Transaction already exists — just add ref to its notes
+            c = wst.cell(dup_row, 12)
+            cur = str(c.value or "")
+            if ref and ref not in cur:
+                c.value = (cur + f" | ref: {ref}").strip(" |")
+            log.info(f"Invoice {inv_no}: transaction already exists at row {dup_row}, skipping creation")
+            return True, False, dup_row
+
+        # ── Create transaction ────────────────────────────────────────────
+        inv_no_display = str(row[1].value or "")
+        tx = {
+            "date":        tx_date,
+            "type":        "Payment",
+            "description": f"{inv_no_display} — {payee}",
+            "payee":       payee,
+            "ccy":         tx_ccy,
+            "amount":      tx_amt,
+            "fx_rate":     upd.get("swift_fx") or None,
+            "comm":        None,
+            "notes":       f"Автозапись из инвойса ({src})" + (f" | ref: {ref}" if ref else ""),
+        }
+        new_row = find_last_row(wst) + 1
+        apply_tx_row(wst, new_row, tx)
+        log.info(f"Invoice {inv_no}: auto-created transaction at row {new_row} ({src})")
+        return True, True, None
+
+    return False, False, None
+
+def repair_invoice_f_column(wsi):
+    """After row deletion, rewrite F column formulas/values with correct row references.
+    Also recomputes USD values for any rows where F is still a formula."""
+    for row in wsi.iter_rows(min_row=5, max_col=6):
+        r = row[0].row
+        if row[0].value is None and row[1].value is None: continue
+        f_cell = row[5]
+        ccy = row[3].value
+        amt = row[4].value
+        # Recompute as number if possible
+        if isinstance(amt, (int,float)) and amt > 0 and ccy:
+            usd = _compute_usd(wsi.parent, str(ccy), amt)
+            if usd:
+                f_cell.value = usd
+                continue
+        # Otherwise rewrite formula with correct row number
+        if isinstance(f_cell.value, str) and f_cell.value.startswith('='):
+            f_cell.value = (f'=IF(OR(E{r}="",E{r}="TBC"),"TBC",'
+                           f'IFERROR(E{r}/VLOOKUP(D{r},Settings!$A$7:$B$17,2,FALSE()),E{r}))')
+
 
 def add_new_invoice(ws, inv, last_row):
-    r  = last_row + 1
-    st = inv.get("status","⏳ Pending")
-    bg = STAT_BG.get(st, YELLOW)
+    r   = last_row + 1
+    st  = inv.get("status","⏳ Pending")
+    bg  = STAT_BG.get(st, YELLOW)
+    ccy = inv.get("ccy","")
+    amt = inv.get("amount")
     for col_i, val in enumerate([
         inv.get("date",""), inv.get("invoice_no",""), inv.get("payee",""),
-        inv.get("ccy",""), inv.get("amount"), None, st,
-        inv.get("date_paid",""), inv.get("ref",""), inv.get("notes","")
+        ccy, amt, None, st, inv.get("date_paid",""), inv.get("ref",""), inv.get("notes","")
     ], 1):
         c = ws.cell(r, col_i, val if val is not None else "")
         sc(c, bg=bg, wrap=(col_i in (3,10)), sz=9)
-    ws.cell(r,6).value = (f'=IF(OR(E{r}="",E{r}="TBC"),"TBC",'
-                          f'IFERROR(E{r}/VLOOKUP(D{r},Settings!$A$7:$B$17,2,FALSE),E{r}))')
+    # Store USD as computed number — survives openpyxl save (no formula cache issue)
+    if isinstance(amt, (int,float)) and amt > 0 and ccy:
+        usd = _compute_usd(ws.parent, ccy, amt)
+        ws.cell(r, 6).value = usd if usd else 0
+    elif str(amt or "").upper() == "TBC" or not amt:
+        ws.cell(r, 6).value = "TBC"
+    else:
+        ws.cell(r, 6).value = (f'=IF(OR(E{r}="",E{r}="TBC"),"TBC",'
+                               f'IFERROR(E{r}/VLOOKUP(D{r},Settings!$A$7:$B$17,2,FALSE()),E{r}))')
     ws.cell(r,6).number_format = '#,##0.00'; sc(ws.cell(r,6), bg=bg)
     ws.row_dimensions[r].height = 26
 
@@ -485,22 +631,67 @@ def apply_transaction_update(ws, upd):
     log.warning(f"Transaction not found for update: {match_desc}")
     return False
 
+def _check_all_duplicates(wst) -> list:
+    """
+    Scan all Transactions for possible duplicates.
+    Returns list of (row_a, row_b, reason) tuples for flagging.
+    """
+    from datetime import timedelta
+    rows = []
+    for row_idx, row in enumerate(wst.iter_rows(min_row=5, max_col=12, values_only=True), start=5):
+        if not row[0]: continue
+        rows.append((row_idx, row))
+
+    flags = []
+    for i, (ra, a) in enumerate(rows):
+        for rb, b in rows[i+1:]:
+            if a[1] not in ("Payment","Deposit") or b[1] not in ("Payment","Deposit"): continue
+            try:
+                amt_a = float(a[5] or 0); amt_b = float(b[5] or 0)
+            except: continue
+            if a[4] != b[4] or amt_a == 0: continue
+            if abs(amt_a - amt_b) / max(amt_a, 1) > 0.01: continue
+            da = _parse_date(a[0]); db = _parse_date(b[0])
+            if da and db and abs((da - db).days) > 10: continue
+            pa = str(a[3] or a[2] or "").lower()
+            pb = str(b[3] or b[2] or "").lower()
+            words = [w for w in pa.split() if len(w) > 3]
+            if not any(w in pb for w in words): continue
+            flags.append((ra, rb, f"{a[4]} {amt_a:,.0f} | {a[3]} | {a[0]} vs {b[0]}"))
+    return flags
+
+
 def write_to_excel(data: dict):
-    if not EXCEL_FILE.exists(): return 0,0,0
+    if not EXCEL_FILE.exists(): return 0,0,0,0,0,[]
     wb  = load_workbook(EXCEL_FILE)
     wst = wb["Transactions"]; wsi = wb["Invoices"]
     tx_a = inv_u = inv_a = 0
     tx_upd = 0
+    auto_tx = 0
+    dup_warnings = []
+
     for tu in data.get("transaction_updates", []):
         if apply_transaction_update(wst, tu): tx_upd += 1
     for tx in data.get("new_transactions", []):
         apply_tx_row(wst, find_last_row(wst) + 1, tx); tx_a += 1
     for upd in data.get("invoice_updates", []):
-        if apply_inv_update(wsi, upd): inv_u += 1
+        found, tx_created, dup_row = apply_inv_update(wsi, upd, wst)
+        if found:
+            inv_u += 1
+            if tx_created: auto_tx += 1
+            if dup_row: dup_warnings.append(
+                f"⚠ Транзакция для {upd.get('invoice_no','')} уже существует (строка {dup_row}) — не дублировал")
     for inv in data.get("new_invoices", []):
         add_new_invoice(wsi, inv, find_last_row(wsi)); inv_a += 1
+
+    # Run duplicate scan across all transactions
+    dup_pairs = _check_all_duplicates(wst)
+    for ra, rb, reason in dup_pairs:
+        _flag_duplicate(wst, ra, rb)
+        dup_warnings.append(f"⚠ ДУБЛЬ: строки {ra} и {rb} — {reason}")
+
     wb.save(EXCEL_FILE)
-    return tx_a, inv_u, inv_a, tx_upd
+    return tx_a, inv_u, inv_a, tx_upd, auto_tx, dup_warnings
 
 # ── Claude API ────────────────────────────────────────────────────────────────
 async def ask_claude(prompt: str, system: str = None) -> str:
@@ -559,7 +750,11 @@ async def parse_messages(msgs_text: str) -> dict:
       "invoice_no": "номер инвойса",
       "new_status": "✅ Paid|⏳ Pending|⚠ Partial/Check|❓ Clarify",
       "date_paid": "DD.MM.YYYY",
-      "ref": "референс"
+      "ref": "референс SWIFT или платёжный",
+      "swift_amount": null,
+      "swift_ccy": null,
+      "swift_date": null,
+      "swift_fx": null
     }}
   ],
   "new_invoices": [
@@ -595,8 +790,16 @@ async def parse_messages(msgs_text: str) -> dict:
 
 Правила:
 - Сообщение с балансом агента ("Остаток: X") — занеси в balance_reconciliation, не в транзакции
-- "ИСПОЛНЕН", "received", "RCVD", "Поступление подтверждаем", "получили", "поступило" = подтверждение → invoice_updates, НЕ новая транзакция
+- "ИСПОЛНЕН", "received", "RCVD", "Поступление подтверждаем", "получили", "поступило" = подтверждение → invoice_updates, НЕ new_transactions
 - Если агент подтверждает получение без деталей — ищи в контексте последнюю UNCONFIRMED/FOLLOW UP транзакцию и обновляй её статус на ✅ Paid
+- SWIFT-детали оплаты: если в сообщении есть SWIFT/MT103/сумма перевода → заполни в invoice_updates:
+  swift_amount = сумма из SWIFT (число)
+  swift_ccy    = валюта из SWIFT
+  swift_date   = дата валютирования из SWIFT (DD.MM.YYYY)
+  swift_fx     = курс конвертации если указан в SWIFT (иначе null)
+  ref          = референс SWIFT (например "PACS008...", "OR260224...")
+  Приоритет суммы для записи транзакции: SWIFT > инвойс > текст сообщения
+- НЕ добавляй транзакцию в new_transactions если инвойс помечается как оплаченный — транзакция создастся автоматически
 - Депозиты от нас агенту = Deposit. Получатель депозита = конечный получатель денег, не агент и не BALKEMY
 - BALKEMY, TROVECO, RAWRIMA, ASTENO = плательщики (наша сторона), а не получатели
 - Кэш который агент нам доставляет = Cash Out
@@ -786,6 +989,9 @@ def apply_edit(data: dict) -> str:
 
     if action == "delete":
         ws.delete_rows(row_n)
+        # After deletion, repair F column formulas/values so row refs stay correct
+        if sheet_name == "Invoices":
+            repair_invoice_f_column(ws)
         wb.save(EXCEL_FILE)
         return f"Строка {row_n} удалена.\n{desc}"
 
@@ -967,7 +1173,7 @@ async def callback_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        tx_a, inv_u, inv_a, tx_upd = write_to_excel(data)
+        tx_a, inv_u, inv_a, tx_upd, auto_tx, dup_warnings = write_to_excel(data)
     except Exception as e:
         await query.edit_message_text(f"Ошибка записи в Excel: {e}")
         log.error(f"Excel write error: {e}"); return
@@ -980,10 +1186,13 @@ async def callback_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     clear_messages()
 
     result = (f"Excel обновлён!\n\n"
-              f"Транзакций добавлено: {tx_a}\n"
+              f"Транзакций добавлено: {tx_a}"
+              + (f" (+{auto_tx} авто из инвойсов)" if auto_tx else "") + "\n"
               f"Транзакций обновлено: {tx_upd}\n"
               f"Инвойсов обновлено: {inv_u}\n"
               f"Инвойсов добавлено: {inv_a}")
+    if dup_warnings:
+        result += "\n\n" + "\n".join(dup_warnings)
     await query.edit_message_text(result)
 
     if EXCEL_FILE.exists():
@@ -1602,7 +1811,7 @@ async def _send_report(bot: Bot, triggered_manually=False):
     if msgs:
         try:
             data    = await parse_messages(_fmt(msgs))
-            tx_a, inv_u, inv_a, tx_upd = write_to_excel(data)
+            tx_a, inv_u, inv_a, tx_upd, auto_tx, dup_warnings = write_to_excel(data)
             if data.get("context_update"):
                 update_context_after_update(data["context_update"])
             if tx_a + inv_u + inv_a > 0:
@@ -1644,7 +1853,7 @@ async def morning_job(ctx: ContextTypes.DEFAULT_TYPE):
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     Path("data").mkdir(exist_ok=True)
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     for cmd, fn in [
         ("start", cmd_start), ("update", cmd_update),
         ("edit", cmd_edit),
@@ -1660,6 +1869,10 @@ def main():
     app.job_queue.run_daily(morning_job, time=time(hour=MORNING_HOUR, minute=0))
     log.info("Bot v3 started")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+async def post_init(app):
+    """Called after bot is initialized — run startup checks."""
+    _ensure_settings_usdt()
 
 if __name__ == "__main__":
     main()
