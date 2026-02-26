@@ -62,11 +62,13 @@ log = logging.getLogger(__name__)
 # ── Styles ────────────────────────────────────────────────────────────────────
 WHITE  = "FFFFFF"; YELLOW = "FFF2CC"; GREEN  = "E2EFDA"
 RED    = "FCE4D6"; ORANGE = "FDEBD0"; LIGHT  = "D6E4F0"; LGRAY  = "F2F2F2"
+BLUE_LIGHT = "BDD7EE"
 thin   = Side(style="thin", color="BFBFBF")
 def B(): return Border(top=thin, bottom=thin, left=thin, right=thin)
 TYPE_BG = {"Deposit": GREEN, "Payment": WHITE, "Cash Out": ORANGE,
            "Cash In": LIGHT, "❓ Unknown": RED}
 STAT_BG = {"✅ Paid": GREEN, "⏳ Pending": YELLOW,
+           "🔄 In Progress": BLUE_LIGHT,
            "⚠ Partial/Check": ORANGE, "❓ Clarify": RED}
 
 def sc(cell, bg=WHITE, bold=False, sz=9, fc="000000", num=None,
@@ -218,7 +220,7 @@ def get_pending_invoices():
         out = []
         usd_total = 0.0
         tbc_count = 0
-        for row in ws.iter_rows(min_row=5, max_col=10, values_only=True):
+        for row in ws.iter_rows(min_row=5, max_col=11, values_only=True):
             if row[6] and row[6] != "✅ Paid" and (row[0] or row[1]):
                 amt_raw = row[4]
                 ccy     = str(row[3] or "")
@@ -233,7 +235,8 @@ def get_pending_invoices():
                 else:
                     usd_str = " (USD TBC)"
                     tbc_count += 1
-                out.append(f"- {row[2] or '?'}: {amt} {ccy}{usd_str}")
+                benef_str = f" | for: {row[10]}" if row[10] else ""
+                out.append(f"- {row[2] or '?'}: {amt} {ccy}{usd_str}{benef_str}")
         return out, usd_total, tbc_count
     except Exception as e:
         log.error(f"Excel pending: {e}"); return [], 0.0, 0
@@ -268,7 +271,8 @@ def get_existing_invoices_list():
         lines = []
         for i, row in enumerate(wi.iter_rows(min_row=5, values_only=True), start=5):
             if row[1] or row[2]:
-                lines.append(f"row={i} | inv={row[1] or '?'} | payee={row[2] or '?'} | ccy={row[3]} | amt={row[4]} | status={row[6]}")
+                benef_str = f" | for={row[10]}" if len(row) > 10 and row[10] else ""
+                lines.append(f"row={i} | inv={row[1] or '?'} | payee={row[2] or '?'} | ccy={row[3]} | amt={row[4]} | status={row[6]}{benef_str}")
         return "\n".join(lines)
     except Exception as e:
         log.error(f"get_existing_invoices: {e}"); return ""
@@ -353,6 +357,13 @@ def apply_tx_row(ws, r, tx):
     sc(ws.cell(r, 10, round(net, 2)), bg=YELLOW, num='#,##0.00')
     # K: Balance — число
     sc(ws.cell(r, 11, bal), bg=YELLOW, bold=True, fc="1F3864", num='#,##0.00')
+    # M: Payer, N: Beneficiary
+    payer = tx.get("payer") or None
+    benef = tx.get("beneficiary") or None
+    if payer is not None:
+        sc(ws.cell(r, 13, payer), bg=bg, sz=9, wrap=False)
+    if benef is not None:
+        sc(ws.cell(r, 14, benef), bg=bg, sz=9, wrap=False)
     ws.row_dimensions[r].height = 28
 
 def _parse_date(s):
@@ -536,6 +547,10 @@ def add_new_invoice(ws, inv, last_row):
         ws.cell(r, 6).value = (f'=IF(OR(E{r}="",E{r}="TBC"),"TBC",'
                                f'IFERROR(E{r}/VLOOKUP(D{r},Settings!$A$7:$B$25,2,FALSE()),E{r}))')
     ws.cell(r,6).number_format = '#,##0.00'; sc(ws.cell(r,6), bg=bg)
+    # K: Beneficiary
+    benef = inv.get("beneficiary") or None
+    if benef is not None:
+        sc(ws.cell(r, 11, benef), bg=bg, sz=9, wrap=False)
     ws.row_dimensions[r].height = 26
 
 
@@ -770,7 +785,7 @@ async def parse_messages(msgs_text: str) -> dict:
   "invoice_updates": [
     {{
       "invoice_no": "номер инвойса",
-      "new_status": "✅ Paid|⏳ Pending|⚠ Partial/Check|❓ Clarify",
+      "new_status": "✅ Paid|⏳ Pending|🔄 In Progress|⚠ Partial/Check|❓ Clarify",
       "date_paid": "DD.MM.YYYY",
       "ref": "референс SWIFT или платёжный",
       "swift_amount": null,
@@ -813,6 +828,10 @@ async def parse_messages(msgs_text: str) -> dict:
 Правила:
 - Сообщение с балансом агента ("Остаток: X") — занеси в balance_reconciliation, не в транзакции
 - "ИСПОЛНЕН", "received", "RCVD", "Поступление подтверждаем", "получили", "поступило" = подтверждение → invoice_updates, НЕ new_transactions
+- Платёжка "in progress", "отправлено", "wire sent", "sent", "в обработке", "transfer initiated", "processing", "выслал", "awaiting confirmation", "initiating payment" →
+  статус инвойса = "🔄 In Progress". Заполни ref/swift_amount/swift_ccy/swift_date если есть в платёжке.
+  НЕ создавай транзакцию в new_transactions — пользователь выберет через кнопки.
+- "исполнено", "executed", "completed", "SWIFT отправлен", "wire completed" → статус "✅ Paid". Транзакция создастся автоматически.
 - Если агент подтверждает получение без деталей — ищи в контексте последнюю UNCONFIRMED/FOLLOW UP транзакцию и обновляй её статус на ✅ Paid
 - SWIFT-детали оплаты: если в сообщении есть SWIFT/MT103/сумма перевода → заполни в invoice_updates:
   swift_amount = сумма из SWIFT (число)
@@ -884,8 +903,12 @@ def format_confirmation(data: dict) -> str:
     if upds:
         lines.append(f"\nОБНОВЛЕНИЯ ИНВОЙСОВ ({len(upds)}):")
         for u in upds:
-            lines.append(f"  ~ {u.get('invoice_no','')} → {u.get('new_status','')} "
-                         f"({u.get('date_paid','')})")
+            status = u.get('new_status','')
+            marker = "🔄" if status == "🔄 In Progress" else "~"
+            ref_str = f" | ref: {u.get('ref','')}" if u.get('ref') else ""
+            amt_str = f" | {u.get('swift_amount')} {u.get('swift_ccy','')}" if u.get('swift_amount') else ""
+            lines.append(f"  {marker} {u.get('invoice_no','')} → {status} "
+                         f"({u.get('date_paid','')}){ref_str}{amt_str}")
 
     invs = data.get("new_invoices", [])
     if invs:
@@ -983,10 +1006,18 @@ async def cmd_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     save_pending(data)
     conf_text = format_confirmation(data)
 
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Записать в Excel", callback_data="confirm_update"),
-         InlineKeyboardButton("❌ Отмена", callback_data="cancel_update")]
-    ])
+    upds_check = data.get("invoice_updates", [])
+    if upds_check:
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Записать в Excel", callback_data="confirm_update")],
+            [InlineKeyboardButton("✅ Записать + Paid + транзакция", callback_data="confirm_mark_paid_with_tx")],
+            [InlineKeyboardButton("❌ Отмена", callback_data="cancel_update")]
+        ])
+    else:
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Записать в Excel", callback_data="confirm_update"),
+             InlineKeyboardButton("❌ Отмена", callback_data="cancel_update")]
+        ])
     await update.message.reply_text(conf_text, reply_markup=keyboard)
 
 
@@ -1024,7 +1055,7 @@ def apply_edit(data: dict) -> str:
     col_map = {
         "col_A":1,"col_B":2,"col_C":3,"col_D":4,"col_E":5,
         "col_F":6,"col_G":7,"col_H":8,"col_I":9,"col_J":10,
-        "col_K":11,"col_L":12
+        "col_K":11,"col_L":12,"col_M":13,"col_N":14
     }
 
     applied = []
@@ -1146,6 +1177,37 @@ async def callback_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if query.data == "cancel_update":
         clear_pending()
         await query.edit_message_text("Отменено. Сообщения не удалены — можешь /update снова.")
+        return
+
+    if query.data == "confirm_mark_paid_with_tx":
+        data = load_pending()
+        if not data:
+            await query.edit_message_text("Нет данных для записи.")
+            return
+        upds = data.get("invoice_updates", [])
+        for u in upds:
+            u["new_status"] = "✅ Paid"
+            if not u.get("date_paid"):
+                from datetime import datetime as _dt
+                u["date_paid"] = _dt.now().strftime("%d.%m.%Y")
+        try:
+            tx_a, inv_u, inv_a, tx_upd, auto_tx, dups = write_to_excel(data)
+            auto_count = sum(1 for x in auto_tx if x) if isinstance(auto_tx, list) else (1 if auto_tx else 0)
+            msg2 = (f"✅ Записано. {len(upds)} инвойс(ов) → Paid.\n"
+                    f"Создано транзакций: {auto_count}.")
+            if dups:
+                msg2 += f"\n⚠ Возможные дубли: {len(dups)}"
+        except Exception as e:
+            await query.edit_message_text(f"Ошибка: {e}"); return
+        clear_pending()
+        await query.edit_message_text(msg2)
+        if EXCEL_FILE.exists():
+            await ctx.bot.send_document(
+                chat_id=MY_CHAT_ID,
+                document=EXCEL_FILE.open("rb"),
+                filename=f"Agent_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+                caption="Excel обновлён ✅"
+            )
         return
 
     data = load_pending()
@@ -1376,7 +1438,7 @@ async def cmd_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
   "invoice_updates": [
     {{
       "invoice_no": "номер или название",
-      "new_status": "✅ Paid|⏳ Pending|⚠ Partial/Check|❓ Clarify",
+      "new_status": "✅ Paid|⏳ Pending|🔄 In Progress|⚠ Partial/Check|❓ Clarify",
       "date_paid": "DD.MM.YYYY",
       "ref": ""
     }}
@@ -1467,12 +1529,12 @@ async def handle_chat(update: Update, ctx: ContextTypes.DEFAULT_TYPE, user_text:
 
 ПАРАМЕТРЫ ПО ДЕЙСТВИЯМ:
 
-add_transaction: date, type(Payment|Deposit|Cash Out|Cash In|❓ Unknown), description, payee, ccy, amount, fx_rate(null=из настроек), comm(null), notes
-add_invoice: date, invoice_no, payee, ccy, amount, status(⏳ Pending), notes
+add_transaction: date, type(Payment|Deposit|Cash Out|Cash In|❓ Unknown), description, payee, ccy, amount, fx_rate(null=из настроек), comm(null), notes, payer(опц.), beneficiary(опц.)
+add_invoice: date, invoice_no, payee, ccy, amount, status(⏳ Pending), notes, beneficiary(опц.)
 edit_transaction: row_number(из списка выше!), changes: {{col_X: value}}
-  Колонки: col_A=Date, col_B=Type, col_C=Desc, col_D=Payee, col_E=CCY, col_F=Amt, col_G=FX, col_L=Notes
+  Колонки: col_A=Date, col_B=Type, col_C=Desc, col_D=Payee, col_E=CCY, col_F=Amt, col_G=FX, col_L=Notes, col_M=Payer, col_N=Beneficiary
 edit_invoice: row_number(из списка инвойсов!), changes: {{col_X: value}}
-  Колонки: col_A=Date, col_B=InvNo, col_C=Payee, col_D=CCY, col_E=Amt, col_G=Status, col_H=DatePaid, col_I=Ref, col_J=Notes
+  Колонки: col_A=Date, col_B=InvNo, col_C=Payee, col_D=CCY, col_E=Amt, col_G=Status, col_H=DatePaid, col_I=Ref, col_J=Notes, col_K=Beneficiary
 delete_transaction: row_number
 delete_invoice: row_number
 mark_invoice_paid: invoice_no, new_status("✅ Paid"), date_paid, ref(опц.), swift_amount(опц.), swift_ccy(опц.) — ИСПОЛЬЗУЙ для отметки инвойса оплаченным, создаёт транзакцию автоматически
@@ -1617,11 +1679,14 @@ async def cmd_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # Format for Claude
     tx_text = "\n".join(
-        f"Row {i+5}: [{r[0]}] {r[1]} | {r[3] or '?'} | {r[5]} {r[4]} | bal={r[10]} | notes={r[11] or ''}"
+        f"Row {i+5}: [{r[0]}] {r[1]} | {r[3] or '?'} | {r[5]} {r[4]} | bal={r[10]} | notes={r[11] or ''}" +
+        (f" | payer={r[12]}" if len(r) > 12 and r[12] else "") +
+        (f" | for={r[13]}" if len(r) > 13 and r[13] else "")
         for i, r in enumerate(tx_rows)
     )
     inv_text = "\n".join(
-        f"Row {i+5}: [{r[0]}] inv={r[1]} | {r[2]} | {r[4]} {r[3]} | status={r[6]} | paid={r[7]}"
+        f"Row {i+5}: [{r[0]}] inv={r[1]} | {r[2]} | {r[4]} {r[3]} | status={r[6]} | paid={r[7]}" +
+        (f" | for={r[10]}" if len(r) > 10 and r[10] else "")
         for i, r in enumerate(inv_rows)
     )
 
@@ -1631,11 +1696,11 @@ async def cmd_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 {context}
 
 ТЕКУЩИЕ ТРАНЗАКЦИИ (Transactions sheet, строки начиная с 5):
-Колонки: A=Date, B=Type, C=Description, D=Payee, E=CCY, F=Amount, G=FX, H=GrossUSD, I=Comm%, J=NetUSD, K=Balance, L=Notes
+Колонки: A=Date, B=Type, C=Description, D=Payee, E=CCY, F=Amount, G=FX, H=GrossUSD, I=Comm%, J=NetUSD, K=Balance, L=Notes, M=Payer, N=Beneficiary
 {tx_text}
 
 ТЕКУЩИЕ ИНВОЙСЫ (Invoices sheet):
-Колонки: A=Date, B=InvNo, C=Payee, D=CCY, E=Amount, F=USD, G=Status, H=DatePaid, I=Ref, J=Notes
+Колонки: A=Date, B=InvNo, C=Payee, D=CCY, E=Amount, F=USD, G=Status, H=DatePaid, I=Ref, J=Notes, K=Beneficiary
 {inv_text}
 
 КОМАНДА ПОЛЬЗОВАТЕЛЯ: {text}
@@ -1669,13 +1734,14 @@ async def cmd_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 - Если команда непонятна или строка не найдена — верни {{"error": "описание проблемы"}}
 - Не пересчитывай баланс — только меняй указанные поля
 
-КОЛОНКИ Transactions: col_A=Date, col_B=Type, col_C=Description, col_D=Payee, col_E=CCY, col_F=Amount(число), col_G=FX, col_H=GrossUSD, col_I=Comm%, col_J=NetUSD, col_K=Balance, col_L=Notes
-КОЛОНКИ Invoices: col_A=Date, col_B=InvNo, col_C=Payee, col_D=CCY(валюта), col_E=Amount(ЧИСЛО!), col_F=USD_equiv, col_G=Status, col_H=DatePaid, col_I=Ref, col_J=Notes
+КОЛОНКИ Transactions: col_A=Date, col_B=Type, col_C=Description, col_D=Payee, col_E=CCY, col_F=Amount(число), col_G=FX, col_H=GrossUSD, col_I=Comm%, col_J=NetUSD, col_K=Balance, col_L=Notes, col_M=Payer, col_N=Beneficiary
+КОЛОНКИ Invoices: col_A=Date, col_B=InvNo, col_C=Payee, col_D=CCY(валюта), col_E=Amount(ЧИСЛО!), col_F=USD_equiv, col_G=Status, col_H=DatePaid, col_I=Ref, col_J=Notes, col_K=Beneficiary
 
 ВАЖНО для Invoices:
 - col_D = валюта (AED/USD/EUR/etc) — СТРОКА
 - col_E = сумма — ЧИСЛО (например 242022.05, не "AED"!)
-- Никогда не пиши валюту в col_E — только число"""
+- Никогда не пиши валюту в col_E — только число
+- Payer/Beneficiary: наши юрлица (RAWRIMA FZCO, BALKEMY GENERAL TRADING, TROVECO DMCC, ELITESPHERE PTE LTD, NEXUS MARINE PTE LTD, GORNIK TRADING LTD и др.)"""
 
     await update.message.reply_text("Анализирую команду...")
 
