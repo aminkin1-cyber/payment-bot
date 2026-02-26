@@ -40,7 +40,7 @@ def _ensure_settings_usdt():
         wb = load_workbook(EXCEL_FILE)
         ws = wb["Settings"]
         # Check if USDT already there
-        for row in ws.iter_rows(min_row=7, max_row=20, values_only=True):
+        for row in ws.iter_rows(min_row=7, max_row=25, values_only=True):
             if row[0] == "USDT": return
         # Add after last FX entry
         for r in range(7, 25):
@@ -109,6 +109,21 @@ def save_chat_history(history: list):
 
 def clear_chat_history():
     if CHAT_HISTORY_FILE.exists(): CHAT_HISTORY_FILE.unlink()
+
+def get_recent_transactions_with_rows(n=10) -> str:
+    """Get last N transactions with row numbers for chat editing."""
+    if not EXCEL_FILE.exists(): return ""
+    try:
+        wb = load_workbook(EXCEL_FILE, data_only=True)
+        ws = wb["Transactions"]
+        rows = []
+        for i, row in enumerate(ws.iter_rows(min_row=5, max_col=12, values_only=True), start=5):
+            if row[0]: rows.append((i, row))
+        lines = []
+        for i, row in rows[-n:]:
+            lines.append(f"row={i} | {row[0]} | {row[1]} | {str(row[2] or '')[:40]} | {row[4]} {row[5]} | K={row[10]}")
+        return "\n".join(lines)
+    except: return ""
 
 def get_excel_summary() -> str:
     """Get compact Excel state for chat context."""
@@ -244,15 +259,16 @@ def get_recent_unconfirmed(days=14):
 
 
 def get_existing_invoices_list():
-    """Return list of existing invoice IDs and payees for dedup check."""
+    """Return list of existing invoice IDs and payees for dedup check.
+    Includes Excel row numbers so Claude can target edits correctly."""
     if not EXCEL_FILE.exists(): return ""
     try:
         wb = load_workbook(EXCEL_FILE, data_only=True)
         wi = wb["Invoices"]
         lines = []
-        for row in wi.iter_rows(min_row=5, values_only=True):
+        for i, row in enumerate(wi.iter_rows(min_row=5, values_only=True), start=5):
             if row[1] or row[2]:
-                lines.append(f"inv={row[1] or '?'} | payee={row[2] or '?'} | ccy={row[3]} | amt={row[4]} | status={row[6]}")
+                lines.append(f"row={i} | inv={row[1] or '?'} | payee={row[2] or '?'} | ccy={row[3]} | amt={row[4]} | status={row[6]}")
         return "\n".join(lines)
     except Exception as e:
         log.error(f"get_existing_invoices: {e}"); return ""
@@ -333,10 +349,10 @@ def apply_tx_row(ws, r, tx):
     sc(ws.cell(r, 8, gross), bg=YELLOW, num="#,##0.00")
     # I: Comm %
     sc(ws.cell(r, 9, comm), bg=YELLOW, fc="0000CC", num="0.0%")
-    # J: Net USD
-    ws.cell(r,10).value = (f'=IF(H{r}="","",IF(OR(B{r}="Deposit",B{r}="Cash In"),'
-                           f'H{r},-(H{r}/MAX(1-I{r},0.0001))))')
-    ws.cell(r,10).number_format = '#,##0.00'; sc(ws.cell(r,10), bg=YELLOW)
+    # J: Net USD — число, не формула (формулы смещаются при copy-paste)
+    sc(ws.cell(r, 10, round(net, 2)), bg=YELLOW, num='#,##0.00')
+    # K: Balance — число
+    sc(ws.cell(r, 11, bal), bg=YELLOW, bold=True, fc="1F3864", num='#,##0.00')
     ws.row_dimensions[r].height = 28
 
 def _parse_date(s):
@@ -495,7 +511,7 @@ def repair_invoice_f_column(wsi):
         # Otherwise rewrite formula with correct row number
         if isinstance(f_cell.value, str) and f_cell.value.startswith('='):
             f_cell.value = (f'=IF(OR(E{r}="",E{r}="TBC"),"TBC",'
-                           f'IFERROR(E{r}/VLOOKUP(D{r},Settings!$A$7:$B$17,2,FALSE()),E{r}))')
+                           f'IFERROR(E{r}/VLOOKUP(D{r},Settings!$A$7:$B$25,2,FALSE()),E{r}))')
 
 
 def add_new_invoice(ws, inv, last_row):
@@ -518,7 +534,7 @@ def add_new_invoice(ws, inv, last_row):
         ws.cell(r, 6).value = "TBC"
     else:
         ws.cell(r, 6).value = (f'=IF(OR(E{r}="",E{r}="TBC"),"TBC",'
-                               f'IFERROR(E{r}/VLOOKUP(D{r},Settings!$A$7:$B$17,2,FALSE()),E{r}))')
+                               f'IFERROR(E{r}/VLOOKUP(D{r},Settings!$A$7:$B$25,2,FALSE()),E{r}))')
     ws.cell(r,6).number_format = '#,##0.00'; sc(ws.cell(r,6), bg=bg)
     ws.row_dimensions[r].height = 26
 
@@ -689,6 +705,12 @@ def write_to_excel(data: dict):
     for ra, rb, reason in dup_pairs:
         _flag_duplicate(wst, ra, rb)
         dup_warnings.append(f"⚠ ДУБЛЬ: строки {ra} и {rb} — {reason}")
+
+    # Recalc full balance chain after any tx additions to fix any gaps
+    if tx_a > 0 or auto_tx > 0:
+        first_new = find_last_row(wst) - (tx_a + auto_tx)
+        if first_new >= 5:
+            _recalc_balance_chain(wst, first_new)
 
     wb.save(EXCEL_FILE)
     return tx_a, inv_u, inv_a, tx_upd, auto_tx, dup_warnings
@@ -992,6 +1014,9 @@ def apply_edit(data: dict) -> str:
         # After deletion, repair F column formulas/values so row refs stay correct
         if sheet_name == "Invoices":
             repair_invoice_f_column(ws)
+        # For Transactions: recompute balance chain from deleted row onward
+        if sheet_name == "Transactions":
+            _recalc_balance_chain(ws, row_n)
         wb.save(EXCEL_FILE)
         return f"Строка {row_n} удалена.\n{desc}"
 
@@ -1022,13 +1047,20 @@ def apply_edit(data: dict) -> str:
         except: amt = 0.0
 
         if amt and tp:
-            # FX rate
-            fx = 1.0
-            try:
-                for srow in wb["Settings"].iter_rows(min_row=7, max_row=17, values_only=True):
-                    if srow[0] == ccy:
-                        fx = float(srow[1]); break
-            except: pass
+            # FX rate: приоритет col_G из changes > Settings
+            # Используем sentinel None — чтобы явный fx=1.0 не перетирался Settings
+            fx = None
+            if changes.get("col_G") is not None:
+                try:
+                    fx = float(changes["col_G"])
+                except: pass
+            if fx is None:
+                fx = 1.0
+                try:
+                    for srow in wb["Settings"].iter_rows(min_row=7, max_row=25, values_only=True):
+                        if srow[0] == ccy:
+                            fx = float(srow[1]); break
+                except: pass
 
             # Comm
             comm_map = {"Deposit":0.0,"Cash In":0.0,"Payment":0.005,"Cash Out":0.005,"❓ Unknown":0.005}
@@ -1070,10 +1102,8 @@ def apply_edit(data: dict) -> str:
             c.font = Font(name="Arial", size=9, color="0000CC")
             c.alignment = Alignment(horizontal="right", vertical="center")
 
-            ws.cell(row_n, 10).value = (f'=IF(H{row_n}="","",IF(OR(B{row_n}="Deposit",'
-                                        f'B{row_n}="Cash In"),H{row_n},'
-                                        f'-(H{row_n}/MAX(1-I{row_n},0.0001))))')
-            c = ws.cell(row_n, 10)
+            # Write J as computed NUMBER — avoids formula reference bugs entirely
+            c = ws.cell(row_n, 10, round(net, 2))
             c.number_format = "#,##0.00"; c.fill = YELLOW
             c.font = Font(name="Arial", size=9)
             c.alignment = Alignment(horizontal="right", vertical="center")
@@ -1091,7 +1121,20 @@ def apply_edit(data: dict) -> str:
                     sep = " | " if cur_notes else ""
                     notes_cell.value = cur_notes + sep + "⏳ ПРЕДВ. КУРС — уточнить у агента"
 
-            applied.append(f"G={round(fx,5)} H={gross} I={comm} J=formula K={round(prev_bal+net,2)}")
+            # Propagate balance change to all subsequent rows
+            _recalc_balance_chain(ws, row_n + 1)
+            applied.append(f"G={round(fx,5)} H={gross} I={comm} J={round(net,2)} K={round(prev_bal+net,2)}")
+
+    # Invoices: recompute F (USD equiv) when amount or CCY changed
+    if sheet_name == "Invoices" and ("col_E" in changes or "col_D" in changes):
+        ccy_inv = ws.cell(row_n, 4).value
+        amt_inv = ws.cell(row_n, 5).value
+        if isinstance(amt_inv, (int,float)) and amt_inv > 0 and ccy_inv:
+            usd = _compute_usd(wb, str(ccy_inv), amt_inv)
+            if usd:
+                ws.cell(row_n, 6).value = usd
+                ws.cell(row_n, 6).number_format = '#,##0.00'
+                applied.append(f"F(USD)={usd}")
 
     wb.save(EXCEL_FILE)
     return f"Применено к строке {row_n}:\n" + "\n".join(f"  {a}" for a in applied) + f"\n\n{desc}"
@@ -1138,6 +1181,18 @@ async def callback_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                              "changes":{},
                              "description":data.get("preview","")}
                 msg2 = apply_edit(edit_data)
+            elif action == "delete_invoice":
+                edit_data = {"type":"edit","sheet":"Invoices",
+                             "action":"delete",
+                             "row_number":params.get("row_number"),
+                             "changes":{},
+                             "description":data.get("preview","")}
+                msg2 = apply_edit(edit_data)
+            elif action == "mark_invoice_paid":
+                # Full invoice_update path — creates auto-transaction
+                inv_data = {"new_transactions":[],"invoice_updates":[params],"new_invoices":[]}
+                tx_a, inv_u, inv_a, tx_upd, auto_tx, dups = write_to_excel(inv_data)
+                msg2 = f"Инвойс обновлён." + (f" Создана транзакция." if auto_tx else "")
             else:
                 msg2 = f"Неизвестное действие: {action}"
         except Exception as e:
@@ -1378,50 +1433,51 @@ async def handle_chat(update: Update, ctx: ContextTypes.DEFAULT_TYPE, user_text:
     existing_inv = get_existing_invoices_list()
 
     # Build messages for Claude
+    recent_tx = get_recent_transactions_with_rows(10)
+
     system_prompt = f"""Ты финансовый ассистент для трекера платежей через агента.
 Отвечай по-русски, кратко и по делу.
-Ты можешь:
-- Отвечать на вопросы о балансе, инвойсах, транзакциях
-- Вносить изменения в Excel (добавить транзакцию, изменить инвойс, удалить строку)
-- Анализировать ситуацию и давать рекомендации
 
 ТЕКУЩЕЕ СОСТОЯНИЕ EXCEL:
 {excel_sum}
 
-УЖЕ СУЩЕСТВУЮЩИЕ ИНВОЙСЫ:
+ПОСЛЕДНИЕ ТРАНЗАКЦИИ (с номерами строк для редактирования):
+{recent_tx}
+
+УЖЕ СУЩЕСТВУЮЩИЕ ИНВОЙСЫ (с номерами строк):
 {existing_inv}
 
 КОНТЕКСТ ПРОЕКТА:
 {context}
 
-Если пользователь просит ДЕЙСТВИЕ (добавить/изменить/удалить) — ответь JSON:
+Если пользователь просит ДЕЙСТВИЕ — ответь JSON:
 {{
   "type": "action",
-  "action": "add_transaction|add_invoice|edit_transaction|edit_invoice|delete_transaction",
+  "action": "add_transaction|add_invoice|edit_transaction|edit_invoice|delete_transaction|delete_invoice|mark_invoice_paid",
   "params": {{...}},
   "preview": "одна строка — что именно сделаем",
   "message": "текст ответа пользователю"
 }}
 
-Если просто ВОПРОС или разговор — ответь JSON:
+Если просто ВОПРОС — ответь JSON:
 {{
   "type": "text",
   "message": "твой ответ"
 }}
 
-Параметры для add_transaction:
-  date, type(Payment|Deposit|Cash Out|Cash In|❓ Unknown), description, payee, ccy, amount, fx_rate(null), comm(null), notes
+ПАРАМЕТРЫ ПО ДЕЙСТВИЯМ:
 
-Параметры для add_invoice:
-  date, invoice_no, payee, ccy, amount, status(⏳ Pending), notes
+add_transaction: date, type(Payment|Deposit|Cash Out|Cash In|❓ Unknown), description, payee, ccy, amount, fx_rate(null=из настроек), comm(null), notes
+add_invoice: date, invoice_no, payee, ccy, amount, status(⏳ Pending), notes
+edit_transaction: row_number(из списка выше!), changes: {{col_X: value}}
+  Колонки: col_A=Date, col_B=Type, col_C=Desc, col_D=Payee, col_E=CCY, col_F=Amt, col_G=FX, col_L=Notes
+edit_invoice: row_number(из списка инвойсов!), changes: {{col_X: value}}
+  Колонки: col_A=Date, col_B=InvNo, col_C=Payee, col_D=CCY, col_E=Amt, col_G=Status, col_H=DatePaid, col_I=Ref, col_J=Notes
+delete_transaction: row_number
+delete_invoice: row_number
+mark_invoice_paid: invoice_no, new_status("✅ Paid"), date_paid, ref(опц.), swift_amount(опц.), swift_ccy(опц.) — ИСПОЛЬЗУЙ для отметки инвойса оплаченным, создаёт транзакцию автоматически
 
-Параметры для edit_transaction/edit_invoice:
-  row_number, changes: {{col_X: value, ...}}
-  Transactions: col_A=Date,col_B=Type,col_C=Desc,col_D=Payee,col_E=CCY,col_F=Amt,col_G=FX,col_H=GrossUSD,col_I=Comm%,col_J=NetUSD,col_K=Bal,col_L=Notes
-  Invoices: col_A=Date,col_B=InvNo,col_C=Payee,col_D=CCY,col_E=Amt(ЧИСЛО!),col_F=USD,col_G=Status,col_H=DatePaid,col_I=Ref,col_J=Notes
-
-Параметры для delete_transaction:
-  row_number"""
+ВАЖНО: row_number ВСЕГДА берётся из списков выше, никогда не угадывай!"""
 
     messages = []
     # Add history
