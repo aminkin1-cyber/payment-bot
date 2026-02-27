@@ -6,7 +6,7 @@ Payment Tracker Bot v3
 - Context view/edit via Telegram
 """
 import os, json, logging, base64
-from datetime import datetime, time
+from datetime import datetime, time, date as date_type, timedelta
 from pathlib import Path
 import httpx
 from openpyxl import load_workbook
@@ -343,6 +343,165 @@ def get_existing_invoices_list():
         return "\n".join(lines)
     except Exception as e:
         log.error(f"get_existing_invoices: {e}"); return ""
+
+def get_recent_transactions(days: int = 60) -> list:
+    """Read recent transactions from Excel for dedup check."""
+    if not EXCEL_FILE.exists():
+        return []
+    try:
+        wb = load_workbook(EXCEL_FILE, data_only=True)
+        ws = wb["Transactions"]
+        cutoff = date_type.today() - timedelta(days=days)
+        result = []
+        for row in ws.iter_rows(min_row=5, max_col=8, values_only=True):
+            if not row[0]:
+                continue
+            d = _parse_date(row[0])
+            if d and d >= cutoff:
+                amt = row[5]  # col F: original amount
+                ccy = str(row[4] or "")
+                if isinstance(amt, (int, float)) and amt > 0 and ccy:
+                    result.append({"date": d, "ccy": ccy, "amount": float(amt)})
+        return result
+    except Exception as e:
+        log.error(f"get_recent_transactions: {e}")
+        return []
+
+
+def _is_duplicate_tx(tx_candidate: dict, existing_txs: list) -> tuple:
+    """
+    Check if a transaction from Claude's output already exists in Excel.
+    Match criteria: same currency + amount within 1% + date within 7 days.
+    """
+    ccy = str(tx_candidate.get("ccy", "")).upper()
+    try:
+        amt = float(tx_candidate.get("amount", 0))
+    except (TypeError, ValueError):
+        return False, ""
+    if amt <= 0 or not ccy:
+        return False, ""
+
+    date_str = tx_candidate.get("date", "")
+    tx_date = _parse_date(date_str) if date_str else None
+
+    for ex in existing_txs:
+        if ex["ccy"].upper() != ccy:
+            continue
+        if abs(ex["amount"] - amt) / max(ex["amount"], 1) > 0.01:
+            continue
+        if tx_date and ex["date"]:
+            if abs((tx_date - ex["date"]).days) > 7:
+                continue
+        return True, f"{ccy} {amt:,.2f} уже в Excel ({ex['date']})"
+
+    return False, ""
+
+
+def _dedup_transactions(data: dict) -> tuple:
+    """
+    Remove duplicate transactions from Claude's output.
+    Returns (cleaned_data, skipped_descriptions).
+    """
+    txs = data.get("new_transactions", [])
+    if not txs:
+        return data, []
+
+    existing = get_recent_transactions(days=60)
+    clean_txs = []
+    skipped = []
+
+    for tx in txs:
+        is_dup, reason = _is_duplicate_tx(tx, existing)
+        if is_dup:
+            amt = tx.get("amount", 0)
+            ccy = tx.get("ccy", "")
+            skipped.append(f"  ↩ {tx.get('date', '')} | {tx.get('type', '')} | "
+                           f"{float(amt):,.2f} {ccy} — {reason}")
+        else:
+            clean_txs.append(tx)
+
+    data = dict(data)
+    data["new_transactions"] = clean_txs
+    return data, skipped
+
+
+def _get_paid_invoice_nos() -> set:
+    """Return set of invoice_no strings that are already ✅ Paid in Excel."""
+    if not EXCEL_FILE.exists():
+        return set()
+    try:
+        wb = load_workbook(EXCEL_FILE, data_only=True)
+        wi = wb["Invoices"]
+        paid = set()
+        for row in wi.iter_rows(min_row=5, max_col=10, values_only=True):
+            if row[6] == "✅ Paid" and row[1]:
+                paid.add(str(row[1]).strip())
+        return paid
+    except Exception as e:
+        log.error(f"_get_paid_invoice_nos: {e}")
+        return set()
+
+
+def _invoice_has_transaction(invoice_no: str) -> bool:
+    """Check if a transaction referencing this invoice_no exists in Transactions sheet."""
+    if not EXCEL_FILE.exists():
+        return False
+    try:
+        wb = load_workbook(EXCEL_FILE, data_only=True)
+        ws = wb["Transactions"]
+        inv_no_lower = invoice_no.lower().strip()
+        for row in ws.iter_rows(min_row=5, max_col=12, values_only=True):
+            for col in (2, 11):
+                cell = str(row[col] or "").lower()
+                if inv_no_lower in cell:
+                    return True
+        return False
+    except Exception as e:
+        log.error(f"_invoice_has_transaction: {e}")
+        return False
+
+
+def _dedup_invoice_updates(data: dict) -> tuple:
+    """
+    Remove invoice_updates where invoice is already Paid AND transaction exists.
+    If Paid but no transaction — keep with ⚠ warning.
+    If In Progress → Paid — always keep (legitimate update).
+    Returns (cleaned_data, skipped_descriptions).
+    """
+    upds = data.get("invoice_updates", [])
+    if not upds:
+        return data, []
+
+    paid_nos = _get_paid_invoice_nos()
+    clean_upds = []
+    skipped = []
+
+    for upd in upds:
+        inv_no = str(upd.get("invoice_no", "")).strip()
+        new_status = upd.get("new_status", "")
+
+        if "Paid" not in new_status:
+            clean_upds.append(upd)
+            continue
+
+        if inv_no not in paid_nos:
+            clean_upds.append(upd)
+            continue
+
+        # Already Paid in Excel — check if transaction exists
+        has_tx = _invoice_has_transaction(inv_no)
+        if has_tx:
+            skipped.append(f"  ↩ {inv_no} → уже ✅ Paid в Excel (транзакция есть)")
+        else:
+            # Keep but warn: manual edit suspected, no transaction
+            upd = dict(upd)
+            upd["_warning"] = "⚠ Инвойс уже Paid в Excel, но транзакция не найдена — проверь"
+            clean_upds.append(upd)
+
+    data = dict(data)
+    data["invoice_updates"] = clean_upds
+    return data, skipped
+
 
 def get_unknown_transactions():
     if not EXCEL_FILE.exists(): return []
@@ -1137,6 +1296,14 @@ def format_confirmation(data: dict) -> str:
             lines.append(f"  + {tx.get('date','')} | {tx.get('type','')} | "
                          f"{tx.get('payee','')} | {amt} {tx.get('ccy','')}{payer_str}{benef_str}")
 
+    # Show skipped duplicates (transactions + invoice updates combined)
+    skipped_txs = data.get("_skipped_txs", [])
+    skipped_inv = data.get("_skipped_inv_upds", [])
+    all_skipped = skipped_txs + skipped_inv
+    if all_skipped:
+        lines.append(f"\nУЖЕ В EXCEL — пропущено ({len(all_skipped)}):")
+        lines.extend(all_skipped)
+
     upds = data.get("invoice_updates", [])
     if upds:
         lines.append(f"\nОБНОВЛЕНИЯ ИНВОЙСОВ ({len(upds)}):")
@@ -1147,6 +1314,8 @@ def format_confirmation(data: dict) -> str:
             amt_str = f" | {u.get('swift_amount')} {u.get('swift_ccy','')}" if u.get('swift_amount') else ""
             lines.append(f"  {marker} {u.get('invoice_no','')} → {status} "
                          f"({u.get('date_paid','')}){ref_str}{amt_str}")
+            if u.get("_warning"):
+                lines.append(f"    {u['_warning']}")
 
     invs = data.get("new_invoices", [])
     if invs:
@@ -1215,18 +1384,36 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 def _build_confirmation_keyboard(data: dict, confirm_cb: str = "confirm_update") -> InlineKeyboardMarkup:
     """
-    Build confirmation keyboard depending on data content.
-    Always: [✅ Записать] [✏️ Внести правку] [❌ Отмена]
-    If invoice_updates present: add [✅ Записать + Paid + транзакция] as second row.
+    Build smart confirmation keyboard based on what's actually in data.
+    Button label shows exactly what will be written.
     """
+    txs  = data.get("new_transactions", [])
     upds = data.get("invoice_updates", [])
+    invs = data.get("new_invoices", [])
+
+    has_any = bool(txs or upds or invs)
     rows = []
+
+    if not has_any:
+        rows.append([InlineKeyboardButton("❌ Закрыть", callback_data="cancel_update")])
+        return InlineKeyboardMarkup(rows)
+
+    # Build descriptive label
+    parts = []
+    if txs:
+        parts.append(f"{len(txs)} тр.")
     if upds:
-        rows.append([InlineKeyboardButton("✅ Записать в Excel", callback_data=confirm_cb)])
-        rows.append([InlineKeyboardButton("✅ Записать + Paid + транзакция",
-                                          callback_data="confirm_mark_paid_with_tx")])
-    else:
-        rows.append([InlineKeyboardButton("✅ Записать в Excel", callback_data=confirm_cb)])
+        paid_count = sum(1 for u in upds if "Paid" in u.get("new_status", ""))
+        prog_count = len(upds) - paid_count
+        if paid_count:
+            parts.append(f"{paid_count} инв. → Paid")
+        if prog_count:
+            parts.append(f"{prog_count} инв. → обновить")
+    if invs:
+        parts.append(f"{len(invs)} нов. инв.")
+
+    label = "✅ Записать: " + " + ".join(parts)
+    rows.append([InlineKeyboardButton(label, callback_data=confirm_cb)])
     rows.append([InlineKeyboardButton("✏️ Внести правку", callback_data="request_edit")])
     rows.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel_update")])
     return InlineKeyboardMarkup(rows)
@@ -1297,6 +1484,30 @@ async def cmd_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"Новых транзакций не найдено.\n\n{data.get('summary','')}")
         # Still update context
+        if data.get("context_update"):
+            update_context_after_update(data["context_update"])
+        clear_messages()
+        return
+
+    # Dedup: remove transactions and invoice updates already in Excel
+    data, skipped_txs = _dedup_transactions(data)
+    data, skipped_inv = _dedup_invoice_updates(data)
+    if skipped_txs:
+        data["_skipped_txs"] = skipped_txs
+    if skipped_inv:
+        data["_skipped_inv_upds"] = skipped_inv
+
+    # Re-check if anything remains after dedup
+    txs  = data.get("new_transactions", [])
+    upds = data.get("invoice_updates", [])
+    invs = data.get("new_invoices", [])
+
+    if not txs and not upds and not invs:
+        all_skipped = skipped_txs + skipped_inv
+        skipped_msg = "\n".join(all_skipped) if all_skipped else ""
+        await update.message.reply_text(
+            f"Всё уже записано в Excel.\n\n{skipped_msg}\n\n{data.get('summary', '')}"
+        )
         if data.get("context_update"):
             update_context_after_update(data["context_update"])
         clear_messages()
@@ -1486,38 +1697,9 @@ async def callback_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if query.data == "confirm_mark_paid_with_tx":
-        data = load_pending()
-        if not data:
-            await query.edit_message_text("Нет данных для записи.")
-            return
-        upds = data.get("invoice_updates", [])
-        for u in upds:
-            u["new_status"] = "✅ Paid"
-            if not u.get("date_paid"):
-                from datetime import datetime as _dt
-                u["date_paid"] = _dt.now().strftime("%d.%m.%Y")
-        try:
-            tx_a, inv_u, inv_a, tx_upd, auto_tx, dups = write_to_excel(data)
-            auto_count = sum(1 for x in auto_tx if x) if isinstance(auto_tx, list) else (1 if auto_tx else 0)
-            not_found = len(upds) - inv_u
-            msg2 = (f"✅ Записано. {inv_u}/{len(upds)} инвойс(ов) → Paid.\n"
-                    f"Создано транзакций: {tx_a + auto_count}.")
-            if not_found:
-                msg2 += f"\n⚠ Не найдено {not_found} инвойс(ов) — проверь номера вручную"
-            if dups:
-                msg2 += f"\n⚠ Возможные дубли: {len(dups)}"
-        except Exception as e:
-            await query.edit_message_text(f"Ошибка: {e}"); return
-        clear_pending()
-        await query.edit_message_text(msg2)
-        if EXCEL_FILE.exists():
-            await ctx.bot.send_document(
-                chat_id=MY_CHAT_ID,
-                document=EXCEL_FILE.open("rb"),
-                filename=f"Agent_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
-                caption="Excel обновлён ✅"
-            )
-        return
+        # Legacy callback — redirect to confirm_update (Paid+tx logic is always applied now)
+        query.data = "confirm_update"
+
 
     data = load_pending()
     if not data:
