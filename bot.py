@@ -440,7 +440,16 @@ def apply_inv_update(ws, upd, wst=None):
     bg      = STAT_BG.get(status, YELLOW)
 
     for row in ws.iter_rows(min_row=5, max_col=10):
-        if not (inv_no and inv_no in str(row[1].value or "").strip().lower()):
+        if not inv_no:
+            continue
+        cell_inv = str(row[1].value or "").strip().lower()
+        cell_ref = str(row[8].value or "").strip().lower()
+        # Match: extracted inv_no is substring of Excel inv_no OR vice versa,
+        # OR extracted inv_no matches the ref field (col I)
+        matched = (inv_no in cell_inv or
+                   (cell_inv and cell_inv in inv_no) or
+                   (cell_ref and (inv_no in cell_ref or cell_ref in inv_no)))
+        if not matched:
             continue
 
         # ── Update invoice status ─────────────────────────────────────────
@@ -501,6 +510,60 @@ def apply_inv_update(ws, upd, wst=None):
         apply_tx_row(wst, new_row, tx)
         log.info(f"Invoice {inv_no}: auto-created transaction at row {new_row} ({src})")
         return True, True, None
+
+    # ── Fallback: match by payee + amount when inv_no didn't match ──────────
+    swift_amt = upd.get("swift_amount")
+    swift_ccy = upd.get("swift_ccy")
+    payee_hint = str(upd.get("payee") or "").strip().lower()
+    if payee_hint and status == "✅ Paid":
+        for row in ws.iter_rows(min_row=5, max_col=10):
+            if not (row[0].value or row[1].value): continue
+            if row[6].value == "✅ Paid": continue  # already paid
+            cell_payee = str(row[2].value or "").strip().lower()
+            if not cell_payee: continue
+            payee_words = [w for w in payee_hint.split() if len(w) > 3]
+            if not any(w in cell_payee for w in payee_words): continue
+            # Amount match if swift_amount provided
+            if swift_amt:
+                try:
+                    cell_amt = float(row[4].value or 0)
+                    if abs(float(swift_amt) - cell_amt) / max(float(swift_amt), 1) > 0.01:
+                        continue
+                except: continue
+            # Found by payee+amount fallback — update status
+            bg2 = STAT_BG.get(status, YELLOW)
+            row[6].value = status; sc(row[6], bg=bg2, bold=True, align="center")
+            date_paid = upd.get("date_paid", ""); row[7].value = date_paid; sc(row[7], bg=bg2)
+            ref = upd.get("ref", "")
+            if ref: row[8].value = ref; sc(row[8], bg=bg2, sz=8)
+            log.info(f"Invoice fallback match by payee '{payee_hint}' at row {row[0].row}")
+            if wst is None: return True, False, None
+            inv_ccy = str(row[3].value or "")
+            try: inv_amt = float(row[4].value or 0)
+            except: inv_amt = 0.0
+            if swift_amt and swift_ccy:
+                tx_amt = float(swift_amt); tx_ccy = swift_ccy; tx_date = upd.get("swift_date") or date_paid
+                src = "SWIFT"
+            elif inv_amt:
+                tx_amt = inv_amt; tx_ccy = inv_ccy; tx_date = date_paid; src = "инвойс"
+            else:
+                return True, False, None
+            payee_display = str(row[2].value or "")
+            dup_row2 = _find_duplicate_tx(wst, payee_display, tx_ccy, tx_amt, tx_date)
+            if dup_row2:
+                return True, False, dup_row2
+            inv_no_display = str(row[1].value or "")
+            tx = {
+                "date": tx_date, "type": "Payment",
+                "description": f"{inv_no_display} — {payee_display}",
+                "payee": payee_display, "ccy": tx_ccy, "amount": tx_amt,
+                "fx_rate": upd.get("swift_fx") or None, "comm": None,
+                "notes": f"Автозапись из инвойса ({src})" + (f" | ref: {ref}" if ref else ""),
+            }
+            new_row2 = find_last_row(wst) + 1
+            apply_tx_row(wst, new_row2, tx)
+            log.info(f"Invoice fallback: auto-created transaction at row {new_row2}")
+            return True, True, None
 
     return False, False, None
 
@@ -1193,8 +1256,11 @@ async def callback_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         try:
             tx_a, inv_u, inv_a, tx_upd, auto_tx, dups = write_to_excel(data)
             auto_count = sum(1 for x in auto_tx if x) if isinstance(auto_tx, list) else (1 if auto_tx else 0)
-            msg2 = (f"✅ Записано. {len(upds)} инвойс(ов) → Paid.\n"
-                    f"Создано транзакций: {auto_count}.")
+            not_found = len(upds) - inv_u
+            msg2 = (f"✅ Записано. {inv_u}/{len(upds)} инвойс(ов) → Paid.\n"
+                    f"Создано транзакций: {tx_a + auto_count}.")
+            if not_found:
+                msg2 += f"\n⚠ Не найдено {not_found} инвойс(ов) — проверь номера вручную"
             if dups:
                 msg2 += f"\n⚠ Возможные дубли: {len(dups)}"
         except Exception as e:
