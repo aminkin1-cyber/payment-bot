@@ -1575,11 +1575,36 @@ async def cmd_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     invs = data.get("new_invoices", [])
 
     if not txs and not upds and not invs:
-        all_skipped = skipped_txs + skipped_inv
-        skipped_msg = "\n".join(all_skipped) if all_skipped else ""
-        await update.message.reply_text(
-            f"Всё уже записано в Excel.\n\n{skipped_msg}\n\n{data.get('summary', '')}"
-        )
+        rec = data.get("balance_reconciliation", {})
+        agent_bal = rec.get("agent_stated_balance")
+        excel_bal = rec.get("our_excel_balance")
+        diff      = rec.get("difference")
+
+        lines = []
+        date_str = ""
+        for item in (skipped_txs + skipped_inv):
+            # extract date from skipped description if possible
+            pass
+        # Try to get date from skipped inv entries
+        # Just use today as fallback
+        if diff is not None and isinstance(diff, (int, float)):
+            delta_fmt = f"Δ ${abs(float(diff)):,.2f}"
+            status = "✅" if abs(float(diff)) < 100 else "⚠"
+            lines.append(f"Сверка · {delta_fmt} {status}")
+        else:
+            lines.append("Сверка ✅")
+
+        if agent_bal is not None:
+            lines.append(f"\nАгент:  ${float(agent_bal):,.2f}")
+            if excel_bal is not None:
+                lines.append(f"Excel:  ${float(excel_bal):,.2f}")
+            if diff is not None and isinstance(diff, (int, float)):
+                sign = "+" if float(diff) >= 0 else ""
+                lines.append(f"Δ:      {sign}${abs(float(diff)):,.2f}")
+
+        lines.append("\n✅ Все операции уже в Excel")
+
+        await update.message.reply_text("\n".join(lines))
         if data.get("context_update"):
             update_context_after_update(data["context_update"])
         clear_messages()
