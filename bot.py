@@ -378,15 +378,19 @@ def _parse_date(s):
     return None
 
 
-def _find_duplicate_tx(wst, payee: str, ccy: str, amount: float, date_str: str) -> int | None:
+def _find_duplicate_tx(wst, payee: str, ccy: str, amount: float, date_str: str,
+                       ref: str = None) -> int | None:
     """
     Check if Transactions already has a similar Payment row.
     Returns row number if duplicate found, else None.
     Match criteria: same payee (fuzzy) + same CCY + amount within 1% + date within 10 days.
+    EXCLUSION: if ref provided and candidate has a DIFFERENT non-empty ref → not a duplicate
+    (two real payments to same payee for same amount with different refs = different invoices).
     """
     from datetime import timedelta
     ref_date = _parse_date(date_str)
     payee_lo = (payee or "").lower().strip()
+    ref_lo   = (ref or "").lower().strip()
 
     for row_idx, row in enumerate(wst.iter_rows(min_row=5, max_col=12, values_only=True), start=5):
         if not row[0]: continue
@@ -413,6 +417,16 @@ def _find_duplicate_tx(wst, payee: str, ccy: str, amount: float, date_str: str) 
                 date_match = abs((r_date - ref_date).days) <= 10
 
         if payee_match and amt_match and date_match:
+            # Ref exclusion: if we have a ref and the candidate has a DIFFERENT ref → skip
+            if ref_lo:
+                existing_notes = str(row[11] or "").lower()
+                existing_ref = ""
+                if "ref: " in existing_notes:
+                    try:
+                        existing_ref = existing_notes.split("ref: ")[1].split("|")[0].strip().split()[0]
+                    except: pass
+                if existing_ref and existing_ref != ref_lo:
+                    continue  # different refs = different transactions
             return row_idx
     return None
 
@@ -483,7 +497,7 @@ def apply_inv_update(ws, upd, wst=None):
         payee = str(row[2].value or "")
 
         # ── Dedup check ───────────────────────────────────────────────────
-        dup_row = _find_duplicate_tx(wst, payee, tx_ccy, tx_amt, tx_date)
+        dup_row = _find_duplicate_tx(wst, payee, tx_ccy, tx_amt, tx_date, ref=ref)
         if dup_row:
             # Transaction already exists — just add ref to its notes
             c = wst.cell(dup_row, 12)
@@ -549,7 +563,7 @@ def apply_inv_update(ws, upd, wst=None):
             else:
                 return True, False, None
             payee_display = str(row[2].value or "")
-            dup_row2 = _find_duplicate_tx(wst, payee_display, tx_ccy, tx_amt, tx_date)
+            dup_row2 = _find_duplicate_tx(wst, payee_display, tx_ccy, tx_amt, tx_date, ref=ref)
             if dup_row2:
                 return True, False, dup_row2
             inv_no_display = str(row[1].value or "")
