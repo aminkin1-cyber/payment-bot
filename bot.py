@@ -371,7 +371,9 @@ def get_recent_transactions(days: int = 60) -> list:
 def _is_duplicate_tx(tx_candidate: dict, existing_txs: list) -> tuple:
     """
     Check if a transaction from Claude's output already exists in Excel.
-    Match criteria: same currency + amount within 1% + date within 7 days.
+    Match criteria: same currency + amount within 1% + date within window.
+    Window: 60 days for Deposit/Cash In (agent confirms later than receipt),
+            7 days for other types.
     """
     ccy = str(tx_candidate.get("ccy", "")).upper()
     try:
@@ -383,6 +385,9 @@ def _is_duplicate_tx(tx_candidate: dict, existing_txs: list) -> tuple:
 
     date_str = tx_candidate.get("date", "")
     tx_date = _parse_date(date_str) if date_str else None
+    tx_type = str(tx_candidate.get("type", "")).lower()
+    # Deposits and Cash In can appear in agent statements weeks after recording
+    date_window = 60 if any(k in tx_type for k in ("deposit", "cash in", "receipt")) else 7
 
     for ex in existing_txs:
         if ex["ccy"].upper() != ccy:
@@ -390,7 +395,7 @@ def _is_duplicate_tx(tx_candidate: dict, existing_txs: list) -> tuple:
         if abs(ex["amount"] - amt) / max(ex["amount"], 1) > 0.01:
             continue
         if tx_date and ex["date"]:
-            if abs((tx_date - ex["date"]).days) > 7:
+            if abs((tx_date - ex["date"]).days) > date_window:
                 continue
         return True, f"{ccy} {amt:,.2f} уже в Excel ({ex['date']})"
 
@@ -443,17 +448,29 @@ def _get_paid_invoice_nos() -> set:
 
 
 def _invoice_has_transaction(invoice_no: str) -> bool:
-    """Check if a transaction referencing this invoice_no exists in Transactions sheet."""
+    """Check if a transaction referencing this invoice_no exists in Transactions sheet.
+    Strips common suffixes (_RO, _IN, etc.) and searches by base number to handle
+    cases like '2053_RO' stored as 'inv 2053' in transaction descriptions.
+    """
     if not EXCEL_FILE.exists():
         return False
     try:
         wb = load_workbook(EXCEL_FILE, data_only=True)
         ws = wb["Transactions"]
-        inv_no_lower = invoice_no.lower().strip()
+        raw = invoice_no.strip()
+        # Build search variants: full + base (strip _SUFFIX)
+        variants = {raw.lower()}
+        base = raw.split("_")[0].strip()
+        if base and base != raw:
+            variants.add(base.lower())
+        # Also try numeric part only if base is like "2053"
+        if base.isdigit():
+            variants.add(base)
+
         for row in ws.iter_rows(min_row=5, max_col=12, values_only=True):
             for col in (2, 11):
                 cell = str(row[col] or "").lower()
-                if inv_no_lower in cell:
+                if any(v in cell for v in variants):
                     return True
         return False
     except Exception as e:
@@ -1284,79 +1301,126 @@ async def parse_messages(msgs_text: str) -> dict:
 
 # ── Format confirmation message ───────────────────────────────────────────────
 def format_confirmation(data: dict) -> str:
-    lines = ["Вот что я нашёл в сообщениях. Проверь и подтверди запись в Excel.\n"]
+    """
+    Format clean CFO-ready confirmation message.
+    Two parts returned as (report, warnings) — use format_technical_warnings for second message.
+    """
+    lines = []
 
+    # ── Header: date + delta ──────────────────────────────────────────────────
+    rec = data.get("balance_reconciliation", {})
+    agent_bal = rec.get("agent_stated_balance")
+    excel_bal = rec.get("our_excel_balance")
+    diff      = rec.get("difference")
+
+    date_str = ""
+    # Try to get date from first transaction or invoice update
+    for tx in data.get("new_transactions", []):
+        if tx.get("date"): date_str = tx["date"]; break
+    if not date_str:
+        for u in data.get("invoice_updates", []):
+            if u.get("date_paid"): date_str = u["date_paid"]; break
+
+    if date_str and diff is not None:
+        delta_fmt = f"Δ ${abs(float(diff)):,.2f}" if isinstance(diff, (int, float)) else f"Δ {diff}"
+        status = "✅" if isinstance(diff, (int, float)) and abs(float(diff)) < 100 else "⚠"
+        lines.append(f"Сверка {date_str} · {delta_fmt} {status}")
+    else:
+        lines.append("Сверка ✅")
+
+    # ── Balance block ─────────────────────────────────────────────────────────
+    if agent_bal is not None:
+        lines.append("")
+        lines.append(f"Агент:  ${float(agent_bal):>14,.2f}")
+        if excel_bal is not None:
+            lines.append(f"Excel:  ${float(excel_bal):>14,.2f}")
+        if diff is not None and isinstance(diff, (int, float)):
+            sign = "+" if float(diff) >= 0 else ""
+            lines.append(f"Δ:      {sign}${abs(float(diff)):,.2f}")
+
+    # ── Incoming deposits ─────────────────────────────────────────────────────
     txs = data.get("new_transactions", [])
     if txs:
-        lines.append(f"ТРАНЗАКЦИИ ({len(txs)}):")
+        lines.append(f"\n📥 Поступления ({len(txs)}):")
         for tx in txs:
-            amt = f"{tx.get('amount',0):,.2f}" if tx.get('amount') else "?"
-            payer_str = f" | от: {tx.get('payer')}" if tx.get('payer') else ""
-            benef_str = f" | для: {tx.get('beneficiary')}" if tx.get('beneficiary') else ""
-            lines.append(f"  + {tx.get('date','')} | {tx.get('type','')} | "
-                         f"{tx.get('payee','')} | {amt} {tx.get('ccy','')}{payer_str}{benef_str}")
+            try:
+                amt_fmt = f"{float(tx.get('amount', 0)):,.2f}"
+            except (TypeError, ValueError):
+                amt_fmt = str(tx.get('amount', '?'))
+            ccy = tx.get('ccy', '')
+            payee = tx.get('payee') or tx.get('payer') or ""
+            payee_str = f" · {payee}" if payee and payee != "None" else ""
+            lines.append(f"  {amt_fmt} {ccy}{payee_str}")
 
-    # Show skipped duplicates (transactions + invoice updates combined)
-    skipped_txs = data.get("_skipped_txs", [])
-    skipped_inv = data.get("_skipped_inv_upds", [])
-    all_skipped = skipped_txs + skipped_inv
-    if all_skipped:
-        lines.append(f"\nУЖЕ В EXCEL — пропущено ({len(all_skipped)}):")
-        lines.extend(all_skipped)
+    # ── Paid invoices ─────────────────────────────────────────────────────────
+    upds = [u for u in data.get("invoice_updates", []) if "Paid" in u.get("new_status", "")]
+    prog = [u for u in data.get("invoice_updates", []) if "Paid" not in u.get("new_status", "")]
 
-    upds = data.get("invoice_updates", [])
     if upds:
-        lines.append(f"\nОБНОВЛЕНИЯ ИНВОЙСОВ ({len(upds)}):")
+        lines.append(f"\n📤 Оплачено ({len(upds)} инвойс{'ов' if len(upds) != 1 else ''}):")
         for u in upds:
-            status = u.get('new_status','')
-            marker = "🔄" if status == "🔄 In Progress" else "~"
-            ref_str = f" | ref: {u.get('ref','')}" if u.get('ref') else ""
-            amt_str = f" | {u.get('swift_amount')} {u.get('swift_ccy','')}" if u.get('swift_amount') else ""
-            lines.append(f"  {marker} {u.get('invoice_no','')} → {status} "
-                         f"({u.get('date_paid','')}){ref_str}{amt_str}")
-            if u.get("_warning"):
-                lines.append(f"    {u['_warning']}")
+            payee = u.get("payee") or u.get("invoice_no", "?")
+            try:
+                amt = u.get("swift_amount") or u.get("amount")
+                ccy = u.get("swift_ccy") or u.get("ccy", "")
+                amt_fmt = f"{float(amt):,.2f} {ccy}" if amt else ""
+            except (TypeError, ValueError):
+                amt_fmt = str(amt or "")
+            amt_str = f" · {amt_fmt}" if amt_fmt else ""
+            lines.append(f"  {payee}{amt_str}")
 
+    if prog:
+        lines.append(f"\n🔄 Обновлено ({len(prog)}):")
+        for u in prog:
+            payee = u.get("payee") or u.get("invoice_no", "?")
+            lines.append(f"  {payee} → {u.get('new_status', '')}")
+
+    # ── New invoices ──────────────────────────────────────────────────────────
     invs = data.get("new_invoices", [])
     if invs:
-        lines.append(f"\nНОВЫЕ ИНВОЙСЫ ({len(invs)}):")
+        lines.append(f"\n🆕 Новые инвойсы ({len(invs)}):")
         for inv in invs:
-            amt = f"{inv.get('amount',0):,.2f}" if inv.get('amount') else "TBC"
-            benef_inv = f" | для: {inv.get('beneficiary')}" if inv.get('beneficiary') else ""
-            lines.append(f"  + {inv.get('payee','')} | {amt} {inv.get('ccy','')} | "
-                         f"{inv.get('status','')}{benef_inv}")
+            try:
+                amt_fmt = f"{float(inv.get('amount', 0)):,.2f}"
+            except (TypeError, ValueError):
+                amt_fmt = "TBC"
+            lines.append(f"  {inv.get('payee', '?')} · {amt_fmt} {inv.get('ccy', '')}")
 
-    rec = data.get("balance_reconciliation", {})
-    if rec.get("agent_stated_balance"):
-        lines.append(f"\nСВЕРКА БАЛАНСА:")
-        lines.append(f"  Агент: {rec.get('agent_stated_balance','?')}")
-        lines.append(f"  Excel: {rec.get('our_excel_balance','?')}")
-        diff = rec.get("difference")
-        if diff is not None:
-            lines.append(f"  Разница: {diff:+,.2f}" if isinstance(diff,(int,float)) else f"  Разница: {diff}")
-        explained = rec.get("difference_explained_by", [])
-        if explained:
-            lines.append("  Объясняется:")
-            for e in explained:
-                lines.append(f"    → {e}")
-        unexplained = rec.get("unexplained_difference")
-        if unexplained is not None:
-            if isinstance(unexplained,(int,float)) and abs(float(unexplained)) < 1000:
-                lines.append("  Необъяснённый остаток: ~0 ✅ Сходится!")
-            else:
-                lines.append(f"  Необъяснённый остаток: {unexplained} ⚠ Уточнить у агента!")
+    # ── Skipped (already in Excel) — one line ─────────────────────────────────
+    skipped_txs = data.get("_skipped_txs", [])
+    skipped_inv = data.get("_skipped_inv_upds", [])
+    n_skip_tx  = len(skipped_txs)
+    n_skip_inv = len(skipped_inv)
+    if n_skip_tx or n_skip_inv:
+        parts = []
+        if n_skip_tx:
+            parts.append(f"{n_skip_tx} транзакц{'ия' if n_skip_tx == 1 else 'ии' if n_skip_tx < 5 else 'ий'}")
+        if n_skip_inv:
+            parts.append(f"{n_skip_inv} инвойс{'а' if n_skip_inv < 5 else 'ов'}")
+        lines.append(f"\n↩ {', '.join(parts)} — уже в Excel")
 
-    tx_upds = data.get("transaction_updates", [])
-    if tx_upds:
-        lines.append(f"\nОБНОВЛЕНИЯ ТРАНЗАКЦИЙ ({len(tx_upds)}):")
-        for tu in tx_upds:
-            lines.append(f"  ~ {tu.get('match_description','')} "
-                         f"({'✅ подтверждено' if tu.get('confirmed') else 'обновлено'})")
+    return "\n".join(lines)
 
-    if not txs and not upds and not invs and not tx_upds:
-        lines.append("Новых транзакций или инвойсов не найдено.")
 
-    lines.append(f"\nИТОГ: {data.get('summary','')}")
+def format_technical_warnings(data: dict) -> str:
+    """
+    Format second message with technical warnings (only sent if non-empty).
+    Shown only to the operator, not intended for CFO.
+    """
+    warnings = []
+
+    # Invoices marked Paid in Excel but no transaction found
+    for u in data.get("invoice_updates", []):
+        if u.get("_warning"):
+            inv_no = u.get("invoice_no", "?")
+            payee  = u.get("payee") or inv_no
+            warnings.append(f"  {payee} — Paid в Excel, транзакция не найдена")
+
+    if not warnings:
+        return ""
+
+    lines = ["⚠ Требует проверки:"]
+    lines.extend(warnings)
     return "\n".join(lines)
 
 # ── Commands ──────────────────────────────────────────────────────────────────
@@ -1519,6 +1583,11 @@ async def cmd_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     keyboard = _build_confirmation_keyboard(data)
     await update.message.reply_text(conf_text, reply_markup=keyboard)
+
+    # Send technical warnings as a separate message (no keyboard)
+    tech_warnings = format_technical_warnings(data)
+    if tech_warnings:
+        await update.message.reply_text(tech_warnings)
 
 
 def apply_edit(data: dict) -> str:
