@@ -63,6 +63,22 @@ log = logging.getLogger(__name__)
 WHITE  = "FFFFFF"; YELLOW = "FFF2CC"; GREEN  = "E2EFDA"
 RED    = "FCE4D6"; ORANGE = "FDEBD0"; LIGHT  = "D6E4F0"; LGRAY  = "F2F2F2"
 BLUE_LIGHT = "BDD7EE"
+
+# ── Agent company filter ──────────────────────────────────────────────────────
+# Fuzzy substring tokens — "Balkemy GT", "BALKEMY GENERAL TRADING", "from Balkemy"
+# all match because "balkemy" is a substring.
+_AGENT_CO_TOKENS = frozenset({
+    "balkemy", "troveco", "elitesphere", "rawrima", "masadan", "gornik",
+    "nexus marine", "asteno",
+})
+
+def is_agent_company_str(val) -> bool:
+    """Returns True if val looks like one of the agent's companies.
+    Uses fuzzy substring matching so "Balkemy GT" and "BALKEMY GENERAL TRADING"
+    both return True. Agent companies should never be written as beneficiary."""
+    if not val: return False
+    lo = str(val).lower()
+    return any(token in lo for token in _AGENT_CO_TOKENS)
 thin   = Side(style="thin", color="BFBFBF")
 def B(): return Border(top=thin, bottom=thin, left=thin, right=thin)
 TYPE_BG = {"Deposit": GREEN, "Payment": WHITE, "Cash Out": ORANGE,
@@ -362,7 +378,7 @@ def apply_tx_row(ws, r, tx):
     benef = tx.get("beneficiary") or None
     if payer is not None:
         sc(ws.cell(r, 13, payer), bg=bg, sz=9, wrap=False)
-    if benef is not None:
+    if benef is not None and not is_agent_company_str(benef):
         sc(ws.cell(r, 14, benef), bg=bg, sz=9, wrap=False)
     ws.row_dimensions[r].height = 28
 
@@ -453,7 +469,7 @@ def apply_inv_update(ws, upd, wst=None):
     status  = upd.get("new_status","✅ Paid")
     bg      = STAT_BG.get(status, YELLOW)
 
-    for row in ws.iter_rows(min_row=5, max_col=10):
+    for row in ws.iter_rows(min_row=5, max_col=11):
         if not inv_no:
             continue
         cell_inv = str(row[1].value or "").strip().lower()
@@ -471,6 +487,12 @@ def apply_inv_update(ws, upd, wst=None):
         date_paid = upd.get("date_paid",""); row[7].value = date_paid; sc(row[7], bg=bg)
         ref = upd.get("ref","")
         if ref: row[8].value = ref; sc(row[8], bg=bg, sz=8)
+
+        # Write beneficiary to col K if provided (only our companies, not agent's)
+        benef_upd = upd.get("beneficiary")
+        if benef_upd and not is_agent_company_str(benef_upd):
+            row[10].value = benef_upd
+            sc(row[10], bg=bg, sz=9)
 
         # ── Only auto-create transaction when marking as Paid ────────────
         if status != "✅ Paid" or wst is None:
@@ -520,6 +542,11 @@ def apply_inv_update(ws, upd, wst=None):
             "comm":        None,
             "notes":       f"Автозапись из инвойса ({src})" + (f" | ref: {ref}" if ref else ""),
         }
+        # Inherit beneficiary: upd field has priority over invoice col K
+        inv_benef = row[10].value if len(row) > 10 else None
+        final_benef = (upd.get("beneficiary") or inv_benef)
+        if final_benef and not is_agent_company_str(final_benef):
+            tx["beneficiary"] = final_benef
         new_row = find_last_row(wst) + 1
         apply_tx_row(wst, new_row, tx)
         log.info(f"Invoice {inv_no}: auto-created transaction at row {new_row} ({src})")
@@ -530,7 +557,7 @@ def apply_inv_update(ws, upd, wst=None):
     swift_ccy = upd.get("swift_ccy")
     payee_hint = str(upd.get("payee") or "").strip().lower()
     if payee_hint and status == "✅ Paid":
-        for row in ws.iter_rows(min_row=5, max_col=10):
+        for row in ws.iter_rows(min_row=5, max_col=11):
             if not (row[0].value or row[1].value): continue
             if row[6].value == "✅ Paid": continue  # already paid
             cell_payee = str(row[2].value or "").strip().lower()
@@ -574,6 +601,11 @@ def apply_inv_update(ws, upd, wst=None):
                 "fx_rate": upd.get("swift_fx") or None, "comm": None,
                 "notes": f"Автозапись из инвойса ({src})" + (f" | ref: {ref}" if ref else ""),
             }
+            # Inherit beneficiary: upd field has priority over invoice col K
+            inv_benef2 = row[10].value if len(row) > 10 else None
+            final_benef2 = (upd.get("beneficiary") or inv_benef2)
+            if final_benef2 and not is_agent_company_str(final_benef2):
+                tx["beneficiary"] = final_benef2
             new_row2 = find_last_row(wst) + 1
             apply_tx_row(wst, new_row2, tx)
             log.info(f"Invoice fallback: auto-created transaction at row {new_row2}")
@@ -856,7 +888,9 @@ async def parse_messages(msgs_text: str) -> dict:
       "amount": 12345.67,
       "fx_rate": null,
       "comm": null,
-      "notes": "доп. инфо"
+      "notes": "доп. инфо",
+      "payer": null,
+      "beneficiary": null
     }}
   ],
   "invoice_updates": [
@@ -868,7 +902,8 @@ async def parse_messages(msgs_text: str) -> dict:
       "swift_amount": null,
       "swift_ccy": null,
       "swift_date": null,
-      "swift_fx": null
+      "swift_fx": null,
+      "beneficiary": null
     }}
   ],
   "new_invoices": [
@@ -879,7 +914,8 @@ async def parse_messages(msgs_text: str) -> dict:
       "ccy": "USD",
       "amount": 12345.67,
       "status": "⏳ Pending",
-      "notes": ""
+      "notes": "",
+      "beneficiary": null
     }}
   ],
   "transaction_updates": [
@@ -920,6 +956,46 @@ async def parse_messages(msgs_text: str) -> dict:
 - НЕ добавляй транзакцию в new_transactions если инвойс помечается как оплаченный — транзакция создастся автоматически
 - Депозиты от нас агенту = Deposit. Получатель депозита = конечный получатель денег, не агент и не BALKEMY
 - BALKEMY, TROVECO, RAWRIMA, ASTENO = плательщики (наша сторона), а не получатели
+
+PAYER (кто отправил, Transactions col M):
+- Всегда одна из компаний агента (матчинг нечёткий, по подстроке):
+  BALKEMY GENERAL TRADING (варианты: Balkemy, BALKEMY GT)
+  TROVECO DMCC (варианты: Troveco)
+  ELITESPHERE PTE LTD (варианты: Elitesphere)
+  RAWRIMA FZCO (варианты: Rawrima)
+  MASADAN TRADING (варианты: Masadan)
+  GORNIK TRADING LTD (варианты: Gornik)
+  NEXUS MARINE PTE LTD (варианты: Nexus Marine, Nexus — когда плательщик)
+  ASTENO LOGISTICS FZCO (варианты: Asteno)
+- "from Balkemy", "BALKEMY account", "Elitesphere→" — всё это payer = Elitesphere/Balkemy
+- Cash Out / Cash In обычно null. Если не ясно → null
+
+BENEFICIARY (для кого, Transactions col N / Invoices col K):
+- ТОЛЬКО наши компании (распознавай нечётко по ключевым словам):
+  MENA → любое название с "MENA" (MENA Terminals, MENA Marine и т.д.)
+  TRADE X → варианты: TradeX, Trade-X, Trade X Middle East
+  INCOMED → любое название с "Incomed"
+  OIQLO / OILQO → варианты: Oiqlo, Oilqo, OIQLO Services
+  MMI = Mercantile Maritime International → варианты: MMI, Mercantile Maritime Int
+  MMR = Mercantile Maritime Resources    → варианты: MMR
+  MMT = Mercantile Maritime Trading      → варианты: MMT
+  MME = Mercantile Maritime Engineering  → варианты: MME
+  Myanmar Petroleum Services → варианты: Myanmar Petroleum, Myanmar Petroleum Svcs
+  Maritime Shipping → любое название с "Maritime Shipping"
+  Asia Shipco → любое название с "Asia Shipco"
+  Nexus → когда выступает бенефициаром (не плательщиком)
+- Компании агента (Balkemy, Troveco, Elitesphere, Rawrima, Masadan, Gornik, Asteno)
+  НИКОГДА не бенефициары → null
+- Для инвойсов: внимательно читай на кого выписан / для кого услуга:
+  "insurance for MENA vessel" → MENA
+  "MMI annual filing" → MMI (= Mercantile Maritime International)
+  "Balkemy NOC letter" → null (Balkemy — агент)
+  "TradeX services" → TRADE X
+  "TROVECO insurance" → null (Troveco — агент)
+- Batch-платёж (один SWIFT на несколько инвойсов разным бенефициарам) →
+  перечисли через запятую: "MMI, MMR, MMT" или "Myanmar Petroleum Svcs, MMI, MMR, MMT"
+  НЕ писать "Multiple SG entities" или любые обобщения с географией
+- Если не ясно → null (лучше пустое чем неверное)
 - Кэш который агент нам доставляет = Cash Out
 - Непонятное → ❓ Unknown
 - Если нечего добавить — пустые массивы
@@ -973,8 +1049,10 @@ def format_confirmation(data: dict) -> str:
         lines.append(f"ТРАНЗАКЦИИ ({len(txs)}):")
         for tx in txs:
             amt = f"{tx.get('amount',0):,.2f}" if tx.get('amount') else "?"
+            payer_str = f" | от: {tx.get('payer')}" if tx.get('payer') else ""
+            benef_str = f" | для: {tx.get('beneficiary')}" if tx.get('beneficiary') else ""
             lines.append(f"  + {tx.get('date','')} | {tx.get('type','')} | "
-                         f"{tx.get('payee','')} | {amt} {tx.get('ccy','')}")
+                         f"{tx.get('payee','')} | {amt} {tx.get('ccy','')}{payer_str}{benef_str}")
 
     upds = data.get("invoice_updates", [])
     if upds:
@@ -992,8 +1070,9 @@ def format_confirmation(data: dict) -> str:
         lines.append(f"\nНОВЫЕ ИНВОЙСЫ ({len(invs)}):")
         for inv in invs:
             amt = f"{inv.get('amount',0):,.2f}" if inv.get('amount') else "TBC"
+            benef_inv = f" | для: {inv.get('beneficiary')}" if inv.get('beneficiary') else ""
             lines.append(f"  + {inv.get('payee','')} | {amt} {inv.get('ccy','')} | "
-                         f"{inv.get('status','')}")
+                         f"{inv.get('status','')}{benef_inv}")
 
     rec = data.get("balance_reconciliation", {})
     if rec.get("agent_stated_balance"):
@@ -1051,6 +1130,56 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+def _build_confirmation_keyboard(data: dict, confirm_cb: str = "confirm_update") -> InlineKeyboardMarkup:
+    """
+    Build confirmation keyboard depending on data content.
+    Always: [✅ Записать] [✏️ Внести правку] [❌ Отмена]
+    If invoice_updates present: add [✅ Записать + Paid + транзакция] as second row.
+    """
+    upds = data.get("invoice_updates", [])
+    rows = []
+    if upds:
+        rows.append([InlineKeyboardButton("✅ Записать в Excel", callback_data=confirm_cb)])
+        rows.append([InlineKeyboardButton("✅ Записать + Paid + транзакция",
+                                          callback_data="confirm_mark_paid_with_tx")])
+    else:
+        rows.append([InlineKeyboardButton("✅ Записать в Excel", callback_data=confirm_cb)])
+    rows.append([InlineKeyboardButton("✏️ Внести правку", callback_data="request_edit")])
+    rows.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel_update")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def apply_pending_edit(pending_data: dict, instruction: str) -> dict:
+    """
+    Apply user's text instruction as a patch to pending JSON.
+    Returns patched data dict (without _awaiting_edit flag).
+    """
+    # Serialize pending without internal flags for Claude
+    clean = {k: v for k, v in pending_data.items() if not k.startswith("_")}
+    pending_str = json.dumps(clean, ensure_ascii=False, indent=2)
+
+    prompt = f"""У тебя есть JSON с данными которые готовятся к записи в Excel.
+Пользователь хочет внести правку перед записью.
+
+ТЕКУЩИЙ JSON:
+{pending_str}
+
+ИНСТРУКЦИЯ ПОЛЬЗОВАТЕЛЯ:
+{instruction}
+
+Верни ПОЛНЫЙ исправленный JSON — точно такой же структуры, только с применёнными правками.
+Правь только то что просит пользователь. Всё остальное оставь без изменений.
+Верни ТОЛЬКО валидный JSON без markdown, без объяснений, без backticks."""
+
+    raw = await ask_claude(prompt, system=(
+        "You are a JSON patch assistant. "
+        "Return ONLY the complete patched JSON, no markdown, no explanation."
+    ))
+    raw = raw.strip().strip("```").strip()
+    if raw.startswith("json"): raw = raw[4:].strip()
+    return json.loads(raw)
+
+
 async def cmd_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msgs = load_messages()
     if not msgs:
@@ -1083,18 +1212,7 @@ async def cmd_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     save_pending(data)
     conf_text = format_confirmation(data)
 
-    upds_check = data.get("invoice_updates", [])
-    if upds_check:
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Записать в Excel", callback_data="confirm_update")],
-            [InlineKeyboardButton("✅ Записать + Paid + транзакция", callback_data="confirm_mark_paid_with_tx")],
-            [InlineKeyboardButton("❌ Отмена", callback_data="cancel_update")]
-        ])
-    else:
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Записать в Excel", callback_data="confirm_update"),
-             InlineKeyboardButton("❌ Отмена", callback_data="cancel_update")]
-        ])
+    keyboard = _build_confirmation_keyboard(data)
     await update.message.reply_text(conf_text, reply_markup=keyboard)
 
 
@@ -1250,6 +1368,23 @@ def apply_edit(data: dict) -> str:
 async def callback_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+
+    if query.data == "request_edit":
+        data = load_pending()
+        if not data:
+            await query.edit_message_text("Нет данных для правки.")
+            return
+        data["_awaiting_edit"] = True
+        save_pending(data)
+        await query.edit_message_text(
+            "✏️ Напиши что изменить.\n\n"
+            "Примеры:\n"
+            "— измени payee на ORIENT INSURANCE\n"
+            "— beneficiary → MMI\n"
+            "— дата 28.02.2026\n"
+            "— сумма 17799.36 AED"
+        )
+        return
 
     if query.data == "cancel_update":
         clear_pending()
@@ -1554,10 +1689,7 @@ async def cmd_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     conf_text = format_confirmation(data)
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Записать в Excel", callback_data="confirm_update"),
-         InlineKeyboardButton("❌ Отмена", callback_data="cancel_update")]
-    ])
+    keyboard = _build_confirmation_keyboard(data)
     save_pending(data)
     await update.message.reply_text(conf_text, reply_markup=keyboard)
 
@@ -1659,10 +1791,7 @@ mark_invoice_paid: invoice_no, new_status("✅ Paid"), date_paid, ref(опц.), 
                         "params": params, "preview": preview}
         save_pending(pending_data)
 
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Применить", callback_data="confirm_update"),
-             InlineKeyboardButton("❌ Отмена",    callback_data="cancel_update")]
-        ])
+        keyboard = _build_confirmation_keyboard(pending_data)
         reply = f"{msg_text}\n\n📋 {preview}"
         await update.message.reply_text(reply, reply_markup=keyboard)
     else:
@@ -1861,10 +1990,7 @@ async def cmd_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     save_pending({"type": "edit", "sheet": sheet, "action": action,
                   "row_number": row_n, "changes": changes, "description": desc})
 
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Применить", callback_data="confirm_update"),
-         InlineKeyboardButton("❌ Отмена",    callback_data="cancel_update")]
-    ])
+    keyboard = _build_confirmation_keyboard({"type": "edit"})
     await update.message.reply_text(confirm_text, reply_markup=keyboard)
 
 async def cmd_balance(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1929,6 +2055,23 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         log.info(f"IGNORED chat_id={msg.chat_id} expected={MY_CHAT_ID}")
         return
     text     = msg.text or msg.caption or ""
+
+    # ── Intercept _awaiting_edit BEFORE forwarded check ──────────────────────
+    if text and not getattr(msg, "document", None):
+        _pending_check = load_pending()
+        if _pending_check.get("_awaiting_edit"):
+            await update.message.reply_text("⏳ Применяю правку...")
+            try:
+                patched = await apply_pending_edit(_pending_check, text)
+                patched.pop("_awaiting_edit", None)
+            except Exception as e:
+                await update.message.reply_text(f"Ошибка при правке: {e}")
+                return
+            save_pending(patched)
+            conf_text = format_confirmation(patched)
+            keyboard = _build_confirmation_keyboard(patched)
+            await update.message.reply_text(conf_text, reply_markup=keyboard)
+            return
 
     # If NOT a forwarded message and NOT a document — treat as chat
     is_forwarded = bool(
