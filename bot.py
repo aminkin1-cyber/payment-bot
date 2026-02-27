@@ -449,23 +449,39 @@ def _get_paid_invoice_nos() -> set:
 
 def _invoice_has_transaction(invoice_no: str) -> bool:
     """Check if a transaction referencing this invoice_no exists in Transactions sheet.
-    Strips common suffixes (_RO, _IN, etc.) and searches by base number to handle
-    cases like '2053_RO' stored as 'inv 2053' in transaction descriptions.
+    Builds multiple search variants to handle format differences like
+    '2053_RO' stored as 'inv 2053', or 'INV 4410 (5YZ...)' stored as 'INV 4410 — 5YZ...'.
     """
     if not EXCEL_FILE.exists():
         return False
     try:
+        import re
         wb = load_workbook(EXCEL_FILE, data_only=True)
         ws = wb["Transactions"]
         raw = invoice_no.strip()
-        # Build search variants: full + base (strip _SUFFIX)
-        variants = {raw.lower()}
+
+        variants = set()
+        variants.add(raw.lower())
+
+        # PRIMARY: exact inv= tag written at transaction creation time
+        variants.add(f"inv={raw.lower()}")
+
+        # Strip _SUFFIX (e.g. 2053_RO → 2053)
         base = raw.split("_")[0].strip()
         if base and base != raw:
             variants.add(base.lower())
-        # Also try numeric part only if base is like "2053"
-        if base.isdigit():
-            variants.add(base)
+            variants.add(f"inv={base.lower()}")
+
+        # Strip everything after first special char/bracket/dash
+        # "INV 4410 (5YZ W L L-2)" → "INV 4410"
+        short = re.split(r'[\(\[\{—\-–]', raw)[0].strip()
+        if short and short != raw:
+            variants.add(short.lower())
+
+        # If we have a number in the string, add just that number
+        nums = re.findall(r'\d{3,}', raw)
+        for n in nums:
+            variants.add(n)
 
         for row in ws.iter_rows(min_row=5, max_col=12, values_only=True):
             for col in (2, 11):
@@ -767,7 +783,7 @@ def apply_inv_update(ws, upd, wst=None):
             "amount":      tx_amt,
             "fx_rate":     upd.get("swift_fx") or None,
             "comm":        None,
-            "notes":       f"Автозапись из инвойса ({src})" + (f" | ref: {ref}" if ref else ""),
+            "notes":       f"inv={inv_no_display} | Автозапись из инвойса ({src})" + (f" | ref: {ref}" if ref else ""),
         }
         # Inherit beneficiary: upd field has priority over invoice col K
         inv_benef = row[10].value if len(row) > 10 else None
@@ -1331,9 +1347,9 @@ def format_confirmation(data: dict) -> str:
     # ── Balance block ─────────────────────────────────────────────────────────
     if agent_bal is not None:
         lines.append("")
-        lines.append(f"Агент:  ${float(agent_bal):>14,.2f}")
+        lines.append(f"Агент:  ${float(agent_bal):,.2f}")
         if excel_bal is not None:
-            lines.append(f"Excel:  ${float(excel_bal):>14,.2f}")
+            lines.append(f"Excel:  ${float(excel_bal):,.2f}")
         if diff is not None and isinstance(diff, (int, float)):
             sign = "+" if float(diff) >= 0 else ""
             lines.append(f"Δ:      {sign}${abs(float(diff)):,.2f}")
@@ -1367,7 +1383,10 @@ def format_confirmation(data: dict) -> str:
             except (TypeError, ValueError):
                 amt_fmt = str(amt or "")
             amt_str = f" · {amt_fmt}" if amt_fmt else ""
-            lines.append(f"  {payee}{amt_str}")
+            # Add brief description if different from payee
+            desc = str(u.get("description") or u.get("invoice_no") or "").strip()
+            desc_str = f"  ← {desc}" if desc and desc.lower() != payee.lower() else ""
+            lines.append(f"  {payee}{amt_str}{desc_str}")
 
     if prog:
         lines.append(f"\n🔄 Обновлено ({len(prog)}):")
@@ -1386,18 +1405,7 @@ def format_confirmation(data: dict) -> str:
                 amt_fmt = "TBC"
             lines.append(f"  {inv.get('payee', '?')} · {amt_fmt} {inv.get('ccy', '')}")
 
-    # ── Skipped (already in Excel) — one line ─────────────────────────────────
-    skipped_txs = data.get("_skipped_txs", [])
-    skipped_inv = data.get("_skipped_inv_upds", [])
-    n_skip_tx  = len(skipped_txs)
-    n_skip_inv = len(skipped_inv)
-    if n_skip_tx or n_skip_inv:
-        parts = []
-        if n_skip_tx:
-            parts.append(f"{n_skip_tx} транзакц{'ия' if n_skip_tx == 1 else 'ии' if n_skip_tx < 5 else 'ий'}")
-        if n_skip_inv:
-            parts.append(f"{n_skip_inv} инвойс{'а' if n_skip_inv < 5 else 'ов'}")
-        lines.append(f"\n↩ {', '.join(parts)} — уже в Excel")
+    # (skipped duplicates not shown in CFO report — internal info only)
 
     return "\n".join(lines)
 
