@@ -891,26 +891,38 @@ def write_to_excel(data: dict):
     return tx_a, inv_u, inv_a, tx_upd, auto_tx, dup_warnings
 
 # ── Claude API ────────────────────────────────────────────────────────────────
-async def ask_claude(prompt_or_content, system: str = None) -> str:
+async def ask_claude(prompt_or_content, system=None) -> str:
     """
     Send a request to Claude API.
     prompt_or_content: str (text-only) or list (multimodal content blocks).
+    system: str (plain) or list (cacheable blocks from _build_parse_system_prompt).
     """
-    sys_msg = system or "You are a financial assistant. Respond in Russian."
+    if system is None:
+        sys_payload = "You are a financial assistant. Respond in Russian."
+    else:
+        sys_payload = system  # str or list — API accepts both
 
     if isinstance(prompt_or_content, str):
         content = [{"type": "text", "text": prompt_or_content}]
     else:
         content = prompt_or_content  # already a list of content blocks
 
-    async with httpx.AsyncClient(timeout=120) as client:  # longer timeout for PDFs
+    # Add caching header only when system is a cacheable list
+    headers = {
+        "x-api-key": ANTHROPIC_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    if isinstance(sys_payload, list):
+        headers["anthropic-beta"] = "prompt-caching-2024-07-31"
+
+    async with httpx.AsyncClient(timeout=120) as client:
         r = await client.post(
             "https://api.anthropic.com/v1/messages",
-            headers={"x-api-key": ANTHROPIC_KEY,
-                     "anthropic-version": "2023-06-01",
-                     "content-type": "application/json"},
+            headers=headers,
             json={"model": "claude-opus-4-6", "max_tokens": 4000,
-                  "system": sys_msg,
+                  "temperature": 0,
+                  "system": sys_payload,
                   "messages": [{"role": "user", "content": content}]},
         )
         data = r.json()
@@ -918,8 +930,11 @@ async def ask_claude(prompt_or_content, system: str = None) -> str:
             raise RuntimeError(f"Claude API error: {data['error']}")
         return data["content"][0]["text"]
 
-def _build_parse_system_prompt() -> str:
-    """Build the full system prompt for parse_messages / invoice parsing."""
+def _build_parse_system_prompt() -> list:
+    """
+    Build the full system prompt for parse_messages / invoice parsing.
+    Returns a cacheable list block for Claude API prompt caching.
+    """
     context = load_context()
     excel_bal = get_balance_from_excel()
     bal_str = f"${excel_bal[0]:,.2f} (запись: {excel_bal[1]})" if excel_bal else "нет данных"
@@ -927,7 +942,7 @@ def _build_parse_system_prompt() -> str:
     unconfirmed_str = "\n".join(unconfirmed) if unconfirmed else "нет"
     existing_inv = get_existing_invoices_list()
 
-    return f"""КОНТЕКСТ ПРОЕКТА (обязательно учитывай):
+    text = f"""КОНТЕКСТ ПРОЕКТА (обязательно учитывай):
 {context}
 
 ТЕКУЩИЙ БАЛАНС В EXCEL: {bal_str}
@@ -1097,6 +1112,8 @@ BENEFICIARY (для кого, Transactions col N / Invoices col K):
 5. unexplained_difference = difference минус сумма объяснённых транзакций
    Если unexplained_difference близко к 0 — всё сходится.
    Если большое — есть реальное расхождение которое надо уточнять у агента."""
+
+    return [{"type": "text", "text": text, "cache_control": {"type": "ephemeral"}}]
 
 
 async def parse_messages(msgs_text: str) -> dict:
@@ -1841,9 +1858,13 @@ mark_invoice_paid: invoice_no, new_status("✅ Paid"), date_paid, ref(опц.), 
                 "https://api.anthropic.com/v1/messages",
                 headers={"x-api-key": ANTHROPIC_KEY,
                          "anthropic-version": "2023-06-01",
+                         "anthropic-beta": "prompt-caching-2024-07-31",
                          "content-type": "application/json"},
                 json={"model": "claude-opus-4-6", "max_tokens": 1500,
-                      "system": system_prompt, "messages": messages},
+                      "temperature": 0,
+                      "system": [{"type": "text", "text": system_prompt,
+                                  "cache_control": {"type": "ephemeral"}}],
+                      "messages": messages},
             )
             raw = _clean_json(r.json()["content"][0]["text"])
             data = json.loads(raw)
