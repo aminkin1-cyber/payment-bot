@@ -5,7 +5,7 @@ Payment Tracker Bot v3
 - Balance reconciliation
 - Context view/edit via Telegram
 """
-import os, json, logging
+import os, json, logging, base64
 from datetime import datetime, time
 from pathlib import Path
 import httpx
@@ -187,6 +187,57 @@ def _fmt(msgs):
             line += f"\n  [СОДЕРЖИМОЕ PDF {m['file']}]:\n  {m['pdf_content'][:2000]}"
         lines.append(line)
     return "\n".join(lines)
+
+def _clean_json(raw: str) -> str:
+    """Strip markdown fences and leading 'json' tag from Claude's response."""
+    raw = raw.strip().strip("```").strip()
+    if raw.startswith("json"): raw = raw[4:].strip()
+    return raw
+
+def _build_multimodal_content(msgs: list) -> list:
+    """
+    Build a multimodal content list for Claude API.
+    Text messages → text blocks.
+    PDFs with pdf_b64 → document blocks (native Claude PDF reading).
+    PDFs with only extracted text → included in text block as fallback.
+    Returns list of content blocks ready for the 'content' field.
+    """
+    content = []
+    text_parts = []
+
+    for m in msgs:
+        line = f"[{m['date']}] {m.get('sender', '?')}:"
+        if m.get("text"):
+            line += f" {m['text']}"
+        if m.get("file") and not m.get("pdf_b64"):
+            # No b64 — include extracted text as fallback
+            line += f" [файл: {m['file']}]"
+            if m.get("pdf_content"):
+                line += f"\n  [ТЕКСТ PDF]:\n  {m['pdf_content'][:2000]}"
+        elif m.get("file") and m.get("pdf_b64"):
+            # Mark that PDF follows as a document block
+            line += f" [PDF: {m['file']} — содержимое ниже как документ]"
+        text_parts.append(line)
+
+    # Text block first (required — context before documents)
+    if text_parts:
+        content.append({"type": "text", "text": "\n".join(text_parts)})
+
+    # Each PDF as a native document block
+    for m in msgs:
+        if m.get("pdf_b64"):
+            content.append({
+                "type": "document",
+                "source": {
+                    "type": "base64",
+                    "media_type": "application/pdf",
+                    "data": m["pdf_b64"],
+                },
+                "title": m.get("file", "invoice.pdf"),
+                "cache_control": {"type": "ephemeral"},
+            })
+
+    return content
 
 # ── Pending confirmation store ────────────────────────────────────────────────
 def save_pending(data: dict):
@@ -840,9 +891,19 @@ def write_to_excel(data: dict):
     return tx_a, inv_u, inv_a, tx_upd, auto_tx, dup_warnings
 
 # ── Claude API ────────────────────────────────────────────────────────────────
-async def ask_claude(prompt: str, system: str = None) -> str:
+async def ask_claude(prompt_or_content, system: str = None) -> str:
+    """
+    Send a request to Claude API.
+    prompt_or_content: str (text-only) or list (multimodal content blocks).
+    """
     sys_msg = system or "You are a financial assistant. Respond in Russian."
-    async with httpx.AsyncClient(timeout=90) as client:
+
+    if isinstance(prompt_or_content, str):
+        content = [{"type": "text", "text": prompt_or_content}]
+    else:
+        content = prompt_or_content  # already a list of content blocks
+
+    async with httpx.AsyncClient(timeout=120) as client:  # longer timeout for PDFs
         r = await client.post(
             "https://api.anthropic.com/v1/messages",
             headers={"x-api-key": ANTHROPIC_KEY,
@@ -850,11 +911,15 @@ async def ask_claude(prompt: str, system: str = None) -> str:
                      "content-type": "application/json"},
             json={"model": "claude-opus-4-6", "max_tokens": 4000,
                   "system": sys_msg,
-                  "messages": [{"role": "user", "content": prompt}]},
+                  "messages": [{"role": "user", "content": content}]},
         )
-        return r.json()["content"][0]["text"]
+        data = r.json()
+        if "error" in data:
+            raise RuntimeError(f"Claude API error: {data['error']}")
+        return data["content"][0]["text"]
 
-async def parse_messages(msgs_text: str) -> dict:
+def _build_parse_system_prompt() -> str:
+    """Build the full system prompt for parse_messages / invoice parsing."""
     context = load_context()
     excel_bal = get_balance_from_excel()
     bal_str = f"${excel_bal[0]:,.2f} (запись: {excel_bal[1]})" if excel_bal else "нет данных"
@@ -862,7 +927,7 @@ async def parse_messages(msgs_text: str) -> dict:
     unconfirmed_str = "\n".join(unconfirmed) if unconfirmed else "нет"
     existing_inv = get_existing_invoices_list()
 
-    prompt = f"""КОНТЕКСТ ПРОЕКТА (обязательно учитывай):
+    return f"""КОНТЕКСТ ПРОЕКТА (обязательно учитывай):
 {context}
 
 ТЕКУЩИЙ БАЛАНС В EXCEL: {bal_str}
@@ -996,27 +1061,31 @@ BENEFICIARY (для кого, Transactions col N / Invoices col K):
   перечисли через запятую: "MMI, MMR, MMT" или "Myanmar Petroleum Svcs, MMI, MMR, MMT"
   НЕ писать "Multiple SG entities" или любые обобщения с географией
 - Если не ясно → null (лучше пустое чем неверное)
+
+ЧТЕНИЕ PDF ИНВОЙСОВ:
+Если в content переданы документы (PDF) — читай их внимательно.
+Из каждого инвойса извлекай:
+- Invoice number (номер инвойса)
+- Date (дата)
+- Payee / Vendor (кому выписан, получатель денег)
+- Amount + Currency (сумма и валюта)
+- Beneficiary — для КОГО эта услуга/товар (не кто получает деньги, а конечный
+  бенефициар: название судна, компании, проекта, человека)
+  Примеры: "vessel MT CHEM RON" → MT CHEM RON
+           "for account of MENA Terminals" → MENA TERMINALS
+           "re: Trade X deal" → TRADE X
+           "visa cancellation for John Doe" → John Doe
+- Payer — кто из компаний агента платит (если указано в инвойсе или платёжке)
+
+Если передан SWIFT / платёжное поручение — извлекай:
+- Ordering customer (плательщик) → payer
+- Beneficiary customer → beneficiary
+- Amount, currency, date, reference
+
+Приоритет данных: PDF документ > текст сообщения (caption/forwarded text)
+
 - Кэш который агент нам доставляет = Cash Out
 - Непонятное → ❓ Unknown
-- Если нечего добавить — пустые массивы
-- ДЕДУПЛИКАЦИЯ: один и тот же инвойс/платёж упомянут несколько раз — добавь ОДИН РАЗ
-- ДЕДУПЛИКАЦИЯ: инвойс уже есть в контексте как оплаченный — не добавляй снова
-- ДЕДУПЛИКАЦИЯ: в new_invoices — объединяй дубли, одна запись на один инвойс
-- Несколько сообщений об одном событии = одна запись
-- ПОДТВЕРЖДЕНИЕ ОТПРАВЛЕННЫХ НАМИ ДЕНЕГ: если агент говорит "Поступление подтверждаем", "received", "получили" 
-  БЕЗ указания инвойса — это значит агент подтвердил наш ранее отправленный депозит или Cash In.
-  В этом случае НЕ добавляй новую транзакцию! Используй transaction_updates чтобы обновить существующую строку.
-  match_description = ключевые слова из описания транзакции (например "150k", "150,000 USD", "50,000 USD")
-  new_notes = старые заметки + " | ПОДТВЕРЖДЕНО АГЕНТОМ [дата]"
-  confirmed = true
-
-- УТОЧНЕНИЕ КУРСА: если в транзакции стоит "⏳ ПРЕДВ. КУРС" (предварительный курс из наших настроек),
-  и агент прислал баланс с указанием фактического курса (например "SGD 110,000 = $87,500 по курсу 1.257"),
-  используй transaction_updates с fx_rate = фактический курс агента.
-  Это пересчитает H (Gross USD), J (Net USD) и всю цепочку балансов K автоматически.
-  match_description = ключевые слова суммы/описания (например "110000 SGD", "Singapore")
-  fx_rate = фактический курс числом (например 1.257)
-  confirmed = true
 
 ЛОГИКА СВЕРКИ БАЛАНСА (если агент прислал остаток):
 1. agent_stated_balance — сумма из сообщения агента в USD
@@ -1027,18 +1096,15 @@ BENEFICIARY (для кого, Transactions col N / Invoices col K):
    Формат: ["$150,000 USD отправлено 24.02 — агент не подтвердил (Pacs.008)"]
 5. unexplained_difference = difference минус сумма объяснённых транзакций
    Если unexplained_difference близко к 0 — всё сходится.
-   Если большое — есть реальное расхождение которое надо уточнять у агента.
+   Если большое — есть реальное расхождение которое надо уточнять у агента."""
 
-Новые сообщения:
-{msgs_text}"""
 
-    raw = await ask_claude(prompt, system=(
-        "You are a JSON extraction assistant. "
-        "Return ONLY valid JSON, no markdown, no explanation, no backticks."
-    ))
-    raw = raw.strip().strip("```").strip()
-    if raw.startswith("json"): raw = raw[4:].strip()
-    return json.loads(raw)
+async def parse_messages(msgs_text: str) -> dict:
+    system = _build_parse_system_prompt()
+    prompt = f"Новые сообщения для анализа:\n{msgs_text}"
+    raw = await ask_claude(prompt, system=system)
+    return json.loads(_clean_json(raw))
+
 
 # ── Format confirmation message ───────────────────────────────────────────────
 def format_confirmation(data: dict) -> str:
@@ -1175,9 +1241,7 @@ async def apply_pending_edit(pending_data: dict, instruction: str) -> dict:
         "You are a JSON patch assistant. "
         "Return ONLY the complete patched JSON, no markdown, no explanation."
     ))
-    raw = raw.strip().strip("```").strip()
-    if raw.startswith("json"): raw = raw[4:].strip()
-    return json.loads(raw)
+    return json.loads(_clean_json(raw))
 
 
 async def cmd_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1187,10 +1251,23 @@ async def cmd_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "Нет накопленных сообщений. Перешли что-нибудь от агента.")
         return
 
-    await update.message.reply_text(f"Анализирую {len(msgs)} сообщений...")
+    has_pdfs = any(m.get("pdf_b64") for m in msgs)
+    if has_pdfs:
+        pdf_count = sum(1 for m in msgs if m.get("pdf_b64"))
+        await update.message.reply_text(
+            f"Анализирую {len(msgs)} сообщений (в т.ч. {pdf_count} PDF нативно)..."
+        )
+    else:
+        await update.message.reply_text(f"Анализирую {len(msgs)} сообщений...")
 
     try:
-        data = await parse_messages(_fmt(msgs))
+        if has_pdfs:
+            content = _build_multimodal_content(msgs)
+            system  = _build_parse_system_prompt()
+            raw     = await ask_claude(content, system=system)
+            data    = json.loads(_clean_json(raw))
+        else:
+            data = await parse_messages(_fmt(msgs))
     except Exception as e:
         await update.message.reply_text(f"Ошибка анализа: {e}")
         log.error(f"Parse error: {e}"); return
@@ -1681,9 +1758,7 @@ async def cmd_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "You are a JSON extraction assistant. "
             "Return ONLY valid JSON, no markdown, no backticks."
         ))
-        raw = raw.strip().strip("`").strip()
-        if raw.startswith("json"): raw = raw[4:].strip()
-        data = json.loads(raw)
+        data = json.loads(_clean_json(raw))
     except Exception as e:
         await update.message.reply_text(f"Ошибка анализа: {e}")
         return
@@ -1770,8 +1845,7 @@ mark_invoice_paid: invoice_no, new_status("✅ Paid"), date_paid, ref(опц.), 
                 json={"model": "claude-opus-4-6", "max_tokens": 1500,
                       "system": system_prompt, "messages": messages},
             )
-            raw = r.json()["content"][0]["text"].strip().strip("`").strip()
-            if raw.startswith("json"): raw = raw[4:].strip()
+            raw = _clean_json(r.json()["content"][0]["text"])
             data = json.loads(raw)
     except Exception as e:
         log.error(f"Chat error: {e}")
@@ -1958,9 +2032,7 @@ async def cmd_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         raw = await ask_claude(prompt, system=(
             "You are a JSON assistant. Return ONLY valid JSON, no markdown, no backticks."
         ))
-        raw = raw.strip().strip("`").strip()
-        if raw.startswith("json"): raw = raw[4:].strip()
-        data = json.loads(raw)
+        data = json.loads(_clean_json(raw))
     except Exception as e:
         await update.message.reply_text(f"Ошибка анализа: {e}")
         return
@@ -2110,35 +2182,56 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
     file_n   = msg.document.file_name if msg.document else ""
+    pdf_b64  = None
     pdf_text = ""
 
-    # Download and read PDF if attached
-    if msg.document and file_n.lower().endswith(".pdf") and HAS_PDF:
+    # Download PDF — store as base64 for native Claude API reading
+    if msg.document and file_n.lower().endswith(".pdf"):
         try:
             tg_file = await msg.document.get_file()
             buf = io.BytesIO()
             await tg_file.download_to_memory(buf)
-            buf.seek(0)
-            reader = PdfReader(buf)
-            pages_text = []
-            for page in reader.pages:
-                t = page.extract_text()
-                if t: pages_text.append(t.strip())
-            pdf_text = "\n".join(pages_text)[:3000]  # limit
-            log.info(f"PDF extracted: {len(pdf_text)} chars from {file_n}")
+            raw_bytes = buf.getvalue()
+
+            if len(raw_bytes) > 5 * 1024 * 1024:  # >5MB — warn + fallback
+                await msg.reply_text(
+                    f"⚠️ PDF {file_n} большой ({len(raw_bytes)//1024//1024}MB), "
+                    f"использую текстовое извлечение"
+                )
+            else:
+                pdf_b64 = base64.b64encode(raw_bytes).decode("utf-8")
+                log.info(f"PDF stored as b64: {file_n}, {len(raw_bytes)//1024}KB")
+
+            # pypdf as text fallback (always attempt for small files)
+            if HAS_PDF and len(raw_bytes) < 10 * 1024 * 1024:
+                try:
+                    buf.seek(0)
+                    reader = PdfReader(buf)
+                    pages_text = [p.extract_text() or "" for p in reader.pages]
+                    pdf_text = "\n".join(pages_text)[:3000]
+                except Exception:
+                    pass  # b64 native path will handle it
+
         except Exception as e:
-            log.error(f"PDF read error: {e}")
-            pdf_text = f"[PDF не удалось прочитать: {e}]"
+            log.error(f"PDF download error: {e}")
+            pdf_text = f"[PDF не удалось скачать: {e}]"
 
     entry = {"date": date_str, "sender": sender, "text": text, "file": file_n}
+    if pdf_b64:
+        entry["pdf_b64"] = pdf_b64
     if pdf_text:
-        entry["pdf_content"] = pdf_text
+        entry["pdf_content"] = pdf_text  # fallback only
     save_message(entry)
 
     preview = text[:60] + ("…" if len(text) > 60 else "")
     parts   = [f"от {sender}"] if sender else []
     if file_n:
-        pdf_note = " (прочитан)" if pdf_text else ""
+        if pdf_b64:
+            pdf_note = " (PDF нативно ✓)"
+        elif pdf_text:
+            pdf_note = " (текст извлечён)"
+        else:
+            pdf_note = ""
         parts.append(f"файл: {file_n}{pdf_note}")
     if preview: parts.append(f'"{preview}"')
     count = len(load_messages())
