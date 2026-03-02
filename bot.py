@@ -1463,11 +1463,22 @@ def _build_confirmation_keyboard(data: dict, confirm_cb: str = "confirm_update")
     upds = data.get("invoice_updates", [])
     invs = data.get("new_invoices", [])
 
-    has_any = bool(txs or upds or invs)
+    # chat_action always has something to confirm
+    is_chat_action = data.get("type") == "chat_action"
+    has_any = bool(txs or upds or invs or is_chat_action)
     rows = []
 
     if not has_any:
         rows.append([InlineKeyboardButton("❌ Закрыть", callback_data="cancel_update")])
+        return InlineKeyboardMarkup(rows)
+
+    # For chat_action use preview as button label
+    if is_chat_action and not (txs or upds or invs):
+        preview = data.get("preview", "выполнить")
+        label = f"✅ {preview}"
+        rows.append([InlineKeyboardButton(label, callback_data=confirm_cb)])
+        rows.append([InlineKeyboardButton("✏️ Внести правку", callback_data="request_edit")])
+        rows.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel_update")])
         return InlineKeyboardMarkup(rows)
 
     # Build descriptive label
