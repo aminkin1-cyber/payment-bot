@@ -199,6 +199,7 @@ def _build_multimodal_content(msgs: list) -> list:
     Build a multimodal content list for Claude API.
     Text messages → text blocks.
     PDFs with pdf_b64 → document blocks (native Claude PDF reading).
+    Images with img_b64 → image blocks (native Claude vision).
     PDFs with only extracted text → included in text block as fallback.
     Returns list of content blocks ready for the 'content' field.
     """
@@ -209,17 +210,18 @@ def _build_multimodal_content(msgs: list) -> list:
         line = f"[{m['date']}] {m.get('sender', '?')}:"
         if m.get("text"):
             line += f" {m['text']}"
-        if m.get("file") and not m.get("pdf_b64"):
+        if m.get("file") and not m.get("pdf_b64") and not m.get("img_b64"):
             # No b64 — include extracted text as fallback
             line += f" [файл: {m['file']}]"
             if m.get("pdf_content"):
                 line += f"\n  [ТЕКСТ PDF]:\n  {m['pdf_content'][:2000]}"
-        elif m.get("file") and m.get("pdf_b64"):
-            # Mark that PDF follows as a document block
+        elif m.get("pdf_b64"):
             line += f" [PDF: {m['file']} — содержимое ниже как документ]"
+        elif m.get("img_b64"):
+            line += f" [Изображение: {m['file']} — содержимое ниже]"
         text_parts.append(line)
 
-    # Text block first (required — context before documents)
+    # Text block first (required — context before documents/images)
     if text_parts:
         content.append({"type": "text", "text": "\n".join(text_parts)})
 
@@ -235,6 +237,18 @@ def _build_multimodal_content(msgs: list) -> list:
                 },
                 "title": m.get("file", "invoice.pdf"),
                 "cache_control": {"type": "ephemeral"},
+            })
+
+    # Each image as a native image block
+    for m in msgs:
+        if m.get("img_b64"):
+            content.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": m.get("img_media", "image/jpeg"),
+                    "data": m["img_b64"],
+                },
             })
 
     return content
@@ -1538,17 +1552,24 @@ async def cmd_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "Нет накопленных сообщений. Перешли что-нибудь от агента.")
         return
 
-    has_pdfs = any(m.get("pdf_b64") for m in msgs)
-    if has_pdfs:
-        pdf_count = sum(1 for m in msgs if m.get("pdf_b64"))
+    has_pdfs   = any(m.get("pdf_b64") for m in msgs)
+    has_images = any(m.get("img_b64") for m in msgs)
+    has_media  = has_pdfs or has_images
+    if has_media:
+        media_count = sum(1 for m in msgs if m.get("pdf_b64") or m.get("img_b64"))
+        pdf_count   = sum(1 for m in msgs if m.get("pdf_b64"))
+        img_count   = sum(1 for m in msgs if m.get("img_b64"))
+        parts = []
+        if pdf_count: parts.append(f"{pdf_count} PDF нативно")
+        if img_count: parts.append(f"{img_count} фото")
         await update.message.reply_text(
-            f"Анализирую {len(msgs)} сообщений (в т.ч. {pdf_count} PDF нативно)..."
+            f"Анализирую {len(msgs)} сообщений (в т.ч. {', '.join(parts)})..."
         )
     else:
         await update.message.reply_text(f"Анализирую {len(msgs)} сообщений...")
 
     try:
-        if has_pdfs:
+        if has_media:
             content = _build_multimodal_content(msgs)
             system  = _build_parse_system_prompt()
             raw     = await ask_claude(content, system=system)
@@ -2467,7 +2488,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         getattr(msg, "forward_sender_name", None) or
         getattr(msg, "forward_from", None)
     )
-    if not is_forwarded and not msg.document and text:
+    if not is_forwarded and not msg.document and not msg.photo and text:
         await handle_chat(update, ctx, text)
         return
 
@@ -2497,9 +2518,40 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             date_str = msg.forward_date.strftime("%d.%m.%Y %H:%M")
     except Exception:
         pass
-    file_n   = msg.document.file_name if msg.document else ""
-    pdf_b64  = None
-    pdf_text = ""
+    file_n    = msg.document.file_name if msg.document else ""
+    pdf_b64   = None
+    pdf_text  = ""
+    img_b64   = None
+    img_media = None
+
+    # Download photo (sent as photo, not file)
+    if msg.photo:
+        try:
+            tg_file = await msg.photo[-1].get_file()  # largest size
+            buf = io.BytesIO()
+            await tg_file.download_to_memory(buf)
+            img_b64   = base64.b64encode(buf.getvalue()).decode("utf-8")
+            img_media = "image/jpeg"
+            file_n    = file_n or "photo.jpg"
+            log.info(f"Photo stored as b64: {len(buf.getvalue())//1024}KB")
+        except Exception as e:
+            log.error(f"Photo download error: {e}")
+
+    # Download image sent as document (jpg/png/webp/gif)
+    _IMG_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".gif")
+    if msg.document and file_n.lower().endswith(_IMG_EXTS):
+        try:
+            tg_file = await msg.document.get_file()
+            buf = io.BytesIO()
+            await tg_file.download_to_memory(buf)
+            ext = file_n.lower().rsplit(".", 1)[-1]
+            img_media = {"jpg": "image/jpeg", "jpeg": "image/jpeg",
+                         "png": "image/png", "webp": "image/webp",
+                         "gif": "image/gif"}.get(ext, "image/jpeg")
+            img_b64   = base64.b64encode(buf.getvalue()).decode("utf-8")
+            log.info(f"Image doc stored as b64: {file_n}, {len(buf.getvalue())//1024}KB")
+        except Exception as e:
+            log.error(f"Image download error: {e}")
 
     # Download PDF — store as base64 for native Claude API reading
     if msg.document and file_n.lower().endswith(".pdf"):
@@ -2537,6 +2589,9 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         entry["pdf_b64"] = pdf_b64
     if pdf_text:
         entry["pdf_content"] = pdf_text  # fallback only
+    if img_b64:
+        entry["img_b64"]   = img_b64
+        entry["img_media"] = img_media
     save_message(entry)
 
     preview = text[:60] + ("…" if len(text) > 60 else "")
@@ -2544,6 +2599,8 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if file_n:
         if pdf_b64:
             pdf_note = " (PDF нативно ✓)"
+        elif img_b64:
+            pdf_note = " (фото нативно ✓)"
         elif pdf_text:
             pdf_note = " (текст извлечён)"
         else:
