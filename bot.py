@@ -236,7 +236,6 @@ def _build_multimodal_content(msgs: list) -> list:
                     "data": m["pdf_b64"],
                 },
                 "title": m.get("file", "invoice.pdf"),
-                "cache_control": {"type": "ephemeral"},
             })
 
     # Each image as a native image block
