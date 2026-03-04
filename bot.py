@@ -1887,13 +1887,7 @@ async def callback_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         clear_pending()
         await query.edit_message_text(msg2)
-        if EXCEL_FILE.exists():
-            await ctx.bot.send_document(
-                chat_id=MY_CHAT_ID,
-                document=EXCEL_FILE.open("rb"),
-                filename=f"Agent_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
-                caption="Excel обновлён"
-            )
+        await _send_excel_and_backup(ctx.bot, caption="Excel обновлён")
         return
 
     # Handle /edit command
@@ -1905,13 +1899,7 @@ async def callback_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             log.error(f"Edit error: {e}"); return
         clear_pending()
         await query.edit_message_text(result_text)
-        if EXCEL_FILE.exists():
-            await ctx.bot.send_document(
-                chat_id=MY_CHAT_ID,
-                document=EXCEL_FILE.open("rb"),
-                filename=f"Agent_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
-                caption="Excel после редактирования"
-            )
+        await _send_excel_and_backup(ctx.bot, caption="Excel после редактирования")
         return
 
     try:
@@ -1936,14 +1924,7 @@ async def callback_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if dup_warnings:
         result += "\n\n" + "\n".join(dup_warnings)
     await query.edit_message_text(result)
-
-    if EXCEL_FILE.exists():
-        await ctx.bot.send_document(
-            chat_id=MY_CHAT_ID,
-            document=EXCEL_FILE.open("rb"),
-            filename=f"Agent_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
-            caption="Обновлённый Excel"
-        )
+    await _send_excel_and_backup(ctx.bot, caption="Обновлённый Excel")
 
 
 async def cmd_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2001,10 +1982,7 @@ async def cmd_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         wb.save(EXCEL_FILE)
         result = f"Удалено {len(deleted)} строк:\n" + "\n".join(f"- {d}" for d in deleted)
         await update.message.reply_text(result)
-        if EXCEL_FILE.exists():
-            await ctx.bot.send_document(chat_id=MY_CHAT_ID,
-                document=EXCEL_FILE.open("rb"),
-                filename="Agent_after_edit.xlsx", caption="Excel после правки")
+        await _send_excel_and_backup(ctx.bot, caption="Excel после правки", filename="Agent_after_edit.xlsx")
         return
 
     # For all other edits — ask Claude to generate JSON
@@ -2247,12 +2225,7 @@ async def cmd_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if deleted:
         msg_text = f"Удалено {len(deleted)} строк:\n" + "\n".join(f"- {d}" for d in deleted)
         await update.message.reply_text(msg_text)
-        await ctx.bot.send_document(
-            chat_id=MY_CHAT_ID,
-            document=EXCEL_FILE.open("rb"),
-            filename="Agent_after_delete.xlsx",
-            caption="Excel после удаления"
-        )
+        await _send_excel_and_backup(ctx.bot, caption="Excel после удаления", filename="Agent_after_delete.xlsx")
     else:
         await update.message.reply_text("Нет строк для удаления.")
 
@@ -2650,13 +2623,8 @@ async def _send_report(bot: Bot, triggered_manually=False):
             + ("\n".join(unknown) if unknown else "нет"))
 
     await bot.send_message(chat_id=MY_CHAT_ID, text=text)
-    if EXCEL_FILE.exists():
-        await bot.send_document(
-            chat_id=MY_CHAT_ID,
-            document=EXCEL_FILE.open("rb"),
-            filename=f"Agent_{datetime.now().strftime('%Y%m%d')}.xlsx",
-            caption="Актуальный Excel"
-        )
+    await _send_excel_and_backup(bot, caption="Актуальный Excel",
+                                 filename=f"Agent_{datetime.now().strftime('%Y%m%d')}.xlsx")
 
 async def morning_job(ctx: ContextTypes.DEFAULT_TYPE):
     await _send_report(ctx.bot)
@@ -2681,8 +2649,59 @@ def main():
     log.info("Bot v3 started")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
+async def _store_backup_file_id(bot, file_id: str):
+    """Persist Excel file_id in bot description (stored on Telegram servers, survives Railway restarts)."""
+    try:
+        payload = json.dumps({"xlsx_fid": file_id, "ts": datetime.now().strftime("%d.%m.%Y")})
+        await bot.set_my_description(description=payload)
+        log.info(f"Backup file_id stored in bot description: {file_id[:24]}…")
+    except Exception as e:
+        log.error(f"_store_backup_file_id error: {e}")
+
+
+async def restore_excel_from_telegram(app):
+    """On startup: fetch Excel from Telegram using stored file_id (crash recovery)."""
+    try:
+        desc_obj = await app.bot.get_my_description()
+        desc = desc_obj.description if desc_obj else ""
+        if not desc:
+            log.info("restore_excel: no backup description found — using local file")
+            return
+        state = json.loads(desc)
+        file_id = state.get("xlsx_fid")
+        if not file_id:
+            log.info("restore_excel: no xlsx_fid in description — using local file")
+            return
+        log.info(f"restore_excel: downloading from Telegram, file_id={file_id[:24]}…")
+        tg_file = await app.bot.get_file(file_id)
+        EXCEL_FILE.parent.mkdir(exist_ok=True)
+        await tg_file.download_to_drive(EXCEL_FILE)
+        log.info(f"restore_excel: Excel restored → {EXCEL_FILE}")
+    except Exception as e:
+        log.error(f"restore_excel_from_telegram error: {e}")
+
+
+async def _send_excel_and_backup(bot, caption: str, filename: str = None):
+    """Send Excel to user AND store file_id in bot description for crash recovery."""
+    if not EXCEL_FILE.exists():
+        return
+    if filename is None:
+        filename = f"Agent_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
+    try:
+        sent = await bot.send_document(
+            chat_id=MY_CHAT_ID,
+            document=EXCEL_FILE.open("rb"),
+            filename=filename,
+            caption=caption,
+        )
+        await _store_backup_file_id(bot, sent.document.file_id)
+    except Exception as e:
+        log.error(f"_send_excel_and_backup error: {e}")
+
+
 async def post_init(app):
     """Called after bot is initialized — run startup checks."""
+    await restore_excel_from_telegram(app)
     _ensure_settings_usdt()
 
 if __name__ == "__main__":
