@@ -2472,7 +2472,8 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     # ── Non-forwarded xlsx → replace Excel file ───────────────────────────────
-    if not is_forwarded and msg.document and file_n.lower().endswith(".xlsx"):
+    _doc_name = (msg.document.file_name or "") if msg.document else ""
+    if not is_forwarded and msg.document and _doc_name.lower().endswith(".xlsx"):
         try:
             tg_file = await msg.document.get_file()
             buf = io.BytesIO()
@@ -2481,7 +2482,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f.write(buf.getvalue())
             bal = get_balance_from_excel()
             await update.message.reply_text(
-                f"✅ Excel обновлён: {file_n} ({len(buf.getvalue())//1024} KB)\n"
+                f"✅ Excel обновлён: {_doc_name} ({len(buf.getvalue())//1024} KB)\n"
                 f"Баланс: {bal}"
             )
         except Exception as e:
