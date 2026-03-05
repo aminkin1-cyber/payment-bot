@@ -60,9 +60,9 @@ def _ensure_settings_usdt():
 log = logging.getLogger(__name__)
 
 # ── Styles ────────────────────────────────────────────────────────────────────
-WHITE  = "FFFFFF"; YELLOW = "FFF2CC"; GREEN  = "E2EFDA"
-RED    = "FCE4D6"; ORANGE = "FDEBD0"; LIGHT  = "D6E4F0"; LGRAY  = "F2F2F2"
-BLUE_LIGHT = "BDD7EE"
+WHITE  = "FFFFFFFF"; YELLOW = "FFFFF2CC"; GREEN  = "FFE2EFDA"
+RED    = "FFFCE4D6"; ORANGE = "FFFDEBD0"; LIGHT  = "FFD6E4F0"; LGRAY  = "FFF2F2F2"
+BLUE_LIGHT = "FFBDD7EE"
 
 # ── Agent company filter ──────────────────────────────────────────────────────
 # Fuzzy substring tokens — "Balkemy GT", "BALKEMY GENERAL TRADING", "from Balkemy"
@@ -84,7 +84,6 @@ def B(): return Border(top=thin, bottom=thin, left=thin, right=thin)
 TYPE_BG = {"Deposit": GREEN, "Payment": WHITE, "Cash Out": ORANGE,
            "Cash In": LIGHT, "❓ Unknown": RED}
 STAT_BG = {"✅ Paid": GREEN, "⏳ Pending": YELLOW,
-           "🔄 In Progress": BLUE_LIGHT,
            "⚠ Partial/Check": ORANGE, "❓ Clarify": RED}
 
 def sc(cell, bg=WHITE, bold=False, sz=9, fc="000000", num=None,
@@ -511,7 +510,6 @@ def _dedup_invoice_updates(data: dict) -> tuple:
     """
     Remove invoice_updates where invoice is already Paid AND transaction exists.
     If Paid but no transaction — keep with ⚠ warning.
-    If In Progress → Paid — always keep (legitimate update).
     Returns (cleaned_data, skipped_descriptions).
     """
     upds = data.get("invoice_updates", [])
@@ -596,7 +594,14 @@ def _prev_balance(ws, r):
     return last
 
 def apply_tx_row(ws, r, tx):
-    tp  = tx.get("type", "Payment")
+    # Normalize type — Claude sometimes returns variants
+    _TYPE_MAP = {
+        "cash-out": "Cash Out", "cash out": "Cash Out", "cashout": "Cash Out",
+        "cash-in": "Cash In",  "cash in": "Cash In",   "cashin": "Cash In",
+        "swift": "Payment",    "wire": "Payment",       "transfer": "Payment",
+        "deposit": "Deposit",  "payment": "Payment",
+    }
+    tp = _TYPE_MAP.get(str(tx.get("type","Payment")).lower(), tx.get("type","Payment"))
     bg  = TYPE_BG.get(tp, WHITE)
     ccy = tx.get("ccy","USD")
 
@@ -604,8 +609,12 @@ def apply_tx_row(ws, r, tx):
     try: amt = float(tx.get("amount") or 0)
     except: amt = 0.0
 
+    # Normalize comm — Claude sometimes returns "0.5%" as string
+    raw_comm = tx.get("comm")
+    if isinstance(raw_comm, str):
+        raw_comm = float(raw_comm.strip().rstrip("%")) / 100
     fx = float(tx.get("fx_rate")) if tx.get("fx_rate") else _get_fx(ws.parent, ccy)
-    comm = float(tx.get("comm")) if tx.get("comm") else _get_comm(tp, ccy)
+    comm = float(raw_comm) if raw_comm is not None else _get_comm(tp, ccy)
     gross = round(amt / fx, 2) if fx else amt
     net   = round(gross, 2) if tp in ("Deposit","Cash In") else round(-(gross/max(1-comm,0.0001)),2)
     bal   = round(_prev_balance(ws, r) + net, 2)
@@ -722,7 +731,12 @@ def apply_inv_update(ws, upd, wst=None):
     Returns (found: bool, tx_created: bool, duplicate_row: int|None)
     """
     inv_no  = str(upd.get("invoice_no","")).strip().lower()
-    status  = upd.get("new_status","✅ Paid")
+    # Normalize status — accept any "Paid" variant → canonical "✅ Paid"
+    raw_status = upd.get("new_status", "✅ Paid")
+    if "paid" in str(raw_status).lower():
+        status = "✅ Paid"
+    else:
+        status = raw_status
     bg      = STAT_BG.get(status, YELLOW)
 
     for row in ws.iter_rows(min_row=5, max_col=11):
@@ -1068,7 +1082,28 @@ def write_to_excel(data: dict):
 
     for tu in data.get("transaction_updates", []):
         if apply_transaction_update(wst, tu): tx_upd += 1
+
+    # Drop new_transactions whose payee/amount matches an invoice_update being paid
+    # (avoids duplicate when Claude creates both a new_transaction AND an invoice_update)
+    inv_update_keys = set()
+    for upd in data.get("invoice_updates", []):
+        if "paid" in str(upd.get("new_status","")).lower():
+            inv_update_keys.add(str(upd.get("invoice_no","")).lower().strip())
+            if upd.get("swift_amount"):
+                inv_update_keys.add(str(upd.get("swift_amount","")))
+
+    filtered_txns = []
     for tx in data.get("new_transactions", []):
+        notes = str(tx.get("notes","") or "").lower()
+        desc  = str(tx.get("description","") or "").lower()
+        amt   = str(tx.get("amount","") or "")
+        skip  = any(k and k in notes or k in desc or k == amt for k in inv_update_keys if k)
+        if not skip:
+            filtered_txns.append(tx)
+        else:
+            log.info(f"Dropped duplicate new_transaction (covered by invoice_update): {tx.get('description','')}")
+
+    for tx in filtered_txns:
         apply_tx_row(wst, find_last_row(wst) + 1, tx); tx_a += 1
     for upd in data.get("invoice_updates", []):
         found, tx_created, dup_row = apply_inv_update(wsi, upd, wst)
@@ -1181,7 +1216,7 @@ def _build_parse_system_prompt() -> list:
   "invoice_updates": [
     {{
       "invoice_no": "номер инвойса",
-      "new_status": "✅ Paid|⏳ Pending|🔄 In Progress|⚠ Partial/Check|❓ Clarify",
+      "new_status": "✅ Paid|⏳ Pending|⚠ Partial/Check|❓ Clarify",
       "date_paid": "DD.MM.YYYY",
       "ref": "референс SWIFT или платёжный",
       "swift_amount": null,
@@ -1226,10 +1261,10 @@ def _build_parse_system_prompt() -> list:
 Правила:
 - Сообщение с балансом агента ("Остаток: X") — занеси в balance_reconciliation, не в транзакции
 - "ИСПОЛНЕН", "received", "RCVD", "Поступление подтверждаем", "получили", "поступило" = подтверждение → invoice_updates, НЕ new_transactions
-- Платёжка "in progress", "отправлено", "wire sent", "sent", "в обработке", "transfer initiated", "processing", "выслал", "awaiting confirmation", "initiating payment" →
-  статус инвойса = "🔄 In Progress". Заполни ref/swift_amount/swift_ccy/swift_date если есть в платёжке.
-  НЕ создавай транзакцию в new_transactions — пользователь выберет через кнопки.
-- "исполнено", "executed", "completed", "SWIFT отправлен", "wire completed" → статус "✅ Paid". Транзакция создастся автоматически.
+- Платёжка "отправлено", "wire sent", "sent", "в обработке", "transfer initiated", "processing", "выслал", "awaiting confirmation", "initiating payment" →
+  статус инвойса = "⏳ Pending" (оставить). Заполни ref/swift_amount/swift_ccy/swift_date если есть в платёжке.
+  НЕ создавай транзакцию в new_transactions — подождём подтверждения исполнения.
+- "исполнено", "executed", "completed", "SWIFT отправлен", "wire completed", платёжное подтверждение из банка → статус "✅ Paid". Транзакция создастся автоматически.
 - Если агент подтверждает получение без деталей — ищи в контексте последнюю UNCONFIRMED/FOLLOW UP транзакцию и обновляй её статус на ✅ Paid
 - SWIFT-детали оплаты: если в сообщении есть SWIFT/MT103/сумма перевода → заполни в invoice_updates:
   swift_amount = сумма из SWIFT (число)
@@ -1463,7 +1498,6 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/unknown — неизвестные транзакции\n"
         "/summary — полный отчёт\n"
         "/excel   — скачать Excel\n"
-        "/upload  — загрузить новый Excel (отправь файл после команды)\n"
         "/clear   — очистить очередь сообщений"
     )
 
@@ -2041,7 +2075,7 @@ async def cmd_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
   "invoice_updates": [
     {{
       "invoice_no": "номер или название",
-      "new_status": "✅ Paid|⏳ Pending|🔄 In Progress|⚠ Partial/Check|❓ Clarify",
+      "new_status": "✅ Paid|⏳ Pending|⚠ Partial/Check|❓ Clarify",
       "date_paid": "DD.MM.YYYY",
       "ref": ""
     }}
@@ -2425,12 +2459,6 @@ async def cmd_excel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Excel файл не найден на сервере.")
 
-async def cmd_upload(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "📎 Отправь файл .xlsx прямым сообщением (не пересылкой).\n"
-        "Текущий Excel будет заменён."
-    )
-
 async def cmd_clear(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     clear_messages()
     await update.message.reply_text("Накопленные сообщения очищены.")
@@ -2469,24 +2497,6 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
     if not is_forwarded and not msg.document and not msg.photo and text:
         await handle_chat(update, ctx, text)
-        return
-
-    # ── Non-forwarded xlsx → replace Excel file ───────────────────────────────
-    _doc_name = (msg.document.file_name or "") if msg.document else ""
-    if not is_forwarded and msg.document and _doc_name.lower().endswith(".xlsx"):
-        try:
-            tg_file = await msg.document.get_file()
-            buf = io.BytesIO()
-            await tg_file.download_to_memory(buf)
-            with open(EXCEL_FILE, "wb") as f:
-                f.write(buf.getvalue())
-            bal = get_balance_from_excel()
-            await update.message.reply_text(
-                f"✅ Excel обновлён: {_doc_name} ({len(buf.getvalue())//1024} KB)\n"
-                f"Баланс: {bal}"
-            )
-        except Exception as e:
-            await update.message.reply_text(f"Ошибка загрузки Excel: {e}")
         return
 
     # Handle both old and new telegram-bot API forward attributes
@@ -2664,7 +2674,7 @@ def main():
         ("edit", cmd_edit),
         ("balance", cmd_balance), ("pending", cmd_pending),
         ("unknown", cmd_unknown), ("summary", cmd_summary),
-        ("excel", cmd_excel), ("upload", cmd_upload), ("context", cmd_context), ("clear", cmd_clear)
+        ("excel", cmd_excel), ("context", cmd_context), ("clear", cmd_clear)
     ]:
         app.add_handler(CommandHandler(cmd, fn))
     app.add_handler(CallbackQueryHandler(callback_confirm))
