@@ -1463,6 +1463,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/unknown — неизвестные транзакции\n"
         "/summary — полный отчёт\n"
         "/excel   — скачать Excel\n"
+        "/upload  — загрузить новый Excel (отправь файл после команды)\n"
         "/clear   — очистить очередь сообщений"
     )
 
@@ -2424,6 +2425,12 @@ async def cmd_excel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Excel файл не найден на сервере.")
 
+async def cmd_upload(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📎 Отправь файл .xlsx прямым сообщением (не пересылкой).\n"
+        "Текущий Excel будет заменён."
+    )
+
 async def cmd_clear(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     clear_messages()
     await update.message.reply_text("Накопленные сообщения очищены.")
@@ -2462,6 +2469,23 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
     if not is_forwarded and not msg.document and not msg.photo and text:
         await handle_chat(update, ctx, text)
+        return
+
+    # ── Non-forwarded xlsx → replace Excel file ───────────────────────────────
+    if not is_forwarded and msg.document and file_n.lower().endswith(".xlsx"):
+        try:
+            tg_file = await msg.document.get_file()
+            buf = io.BytesIO()
+            await tg_file.download_to_memory(buf)
+            with open(EXCEL_FILE, "wb") as f:
+                f.write(buf.getvalue())
+            bal = get_balance_from_excel()
+            await update.message.reply_text(
+                f"✅ Excel обновлён: {file_n} ({len(buf.getvalue())//1024} KB)\n"
+                f"Баланс: {bal}"
+            )
+        except Exception as e:
+            await update.message.reply_text(f"Ошибка загрузки Excel: {e}")
         return
 
     # Handle both old and new telegram-bot API forward attributes
@@ -2639,7 +2663,7 @@ def main():
         ("edit", cmd_edit),
         ("balance", cmd_balance), ("pending", cmd_pending),
         ("unknown", cmd_unknown), ("summary", cmd_summary),
-        ("excel", cmd_excel), ("context", cmd_context), ("clear", cmd_clear)
+        ("excel", cmd_excel), ("upload", cmd_upload), ("context", cmd_context), ("clear", cmd_clear)
     ]:
         app.add_handler(CommandHandler(cmd, fn))
     app.add_handler(CallbackQueryHandler(callback_confirm))
