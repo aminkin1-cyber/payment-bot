@@ -1498,6 +1498,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/unknown — неизвестные транзакции\n"
         "/summary — полный отчёт\n"
         "/excel   — скачать Excel\n"
+        "/upload  — заменить Excel (или просто отправь .xlsx файл)\n"
         "/clear   — очистить очередь сообщений"
     )
 
@@ -2459,6 +2460,12 @@ async def cmd_excel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Excel файл не найден на сервере.")
 
+async def cmd_upload(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📎 Отправь файл .xlsx — бот заменит текущий Excel.\n"
+        "Название файла не важно."
+    )
+
 async def cmd_clear(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     clear_messages()
     await update.message.reply_text("Накопленные сообщения очищены.")
@@ -2487,6 +2494,26 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             conf_text = format_confirmation(patched)
             keyboard = _build_confirmation_keyboard(patched)
             await update.message.reply_text(conf_text, reply_markup=keyboard)
+            return
+
+    # ── xlsx upload: replace Excel regardless of how file was sent ───────────
+    if msg.document:
+        _doc_name = msg.document.file_name or ""
+        if _doc_name.lower().endswith(".xlsx"):
+            try:
+                tg_file = await msg.document.get_file()
+                buf = io.BytesIO()
+                await tg_file.download_to_memory(buf)
+                with open(EXCEL_FILE, "wb") as f:
+                    f.write(buf.getvalue())
+                bal = get_balance_from_excel()
+                bal_str = f"${bal[0]:,.2f}" if bal else "н/д"
+                await update.message.reply_text(
+                    f"✅ Excel обновлён: {_doc_name} ({len(buf.getvalue())//1024} KB)\n"
+                    f"Баланс: {bal_str}"
+                )
+            except Exception as e:
+                await update.message.reply_text(f"Ошибка загрузки Excel: {e}")
             return
 
     # If NOT a forwarded message and NOT a document — treat as chat
@@ -2674,7 +2701,7 @@ def main():
         ("edit", cmd_edit),
         ("balance", cmd_balance), ("pending", cmd_pending),
         ("unknown", cmd_unknown), ("summary", cmd_summary),
-        ("excel", cmd_excel), ("context", cmd_context), ("clear", cmd_clear)
+        ("excel", cmd_excel), ("upload", cmd_upload), ("context", cmd_context), ("clear", cmd_clear)
     ]:
         app.add_handler(CommandHandler(cmd, fn))
     app.add_handler(CallbackQueryHandler(callback_confirm))
