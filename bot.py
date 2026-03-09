@@ -1261,10 +1261,8 @@ def _build_parse_system_prompt() -> list:
 Правила:
 - Сообщение с балансом агента ("Остаток: X") — занеси в balance_reconciliation, не в транзакции
 - "ИСПОЛНЕН", "received", "RCVD", "Поступление подтверждаем", "получили", "поступило" = подтверждение → invoice_updates, НЕ new_transactions
-- Платёжка "отправлено", "wire sent", "sent", "в обработке", "transfer initiated", "processing", "выслал", "awaiting confirmation", "initiating payment" →
-  статус инвойса = "⏳ Pending" (оставить). Заполни ref/swift_amount/swift_ccy/swift_date если есть в платёжке.
-  НЕ создавай транзакцию в new_transactions — подождём подтверждения исполнения.
-- "исполнено", "executed", "completed", "SWIFT отправлен", "wire completed", платёжное подтверждение из банка → статус "✅ Paid". Транзакция создастся автоматически.
+- Платёжка / банковское поручение / SWIFT-документ из банка (любой формат) → статус "✅ Paid". Транзакция создастся автоматически. Заполни ref/swift_amount/swift_ccy/swift_date из документа.
+  Правило простое: если пользователь прислал платёжный документ из банка — платёж состоялся, статус Paid.
 - Если агент подтверждает получение без деталей — ищи в контексте последнюю UNCONFIRMED/FOLLOW UP транзакцию и обновляй её статус на ✅ Paid
 - SWIFT-детали оплаты: если в сообщении есть SWIFT/MT103/сумма перевода → заполни в invoice_updates:
   swift_amount = сумма из SWIFT (число)
